@@ -3,6 +3,7 @@ package canary
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,18 @@ import (
 
 	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return fn(request) }
+
+func jsonResponse(value string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(value)),
+	}
+}
 
 func fixedKR(year int, month time.Month, day, hour, minute int) time.Time {
 	location, _ := time.LoadLocation("Asia/Seoul")
@@ -86,6 +99,52 @@ func TestExecuteOutcomesAndOneRequestBudget(t *testing.T) {
 			}
 			if gotCalls := int(calls.Load()); gotCalls != test.calls {
 				t.Fatalf("requests = %d, want %d (a retry would violate the one-order budget)", gotCalls, test.calls)
+			}
+		})
+	}
+}
+
+// A transport error can occur after edge received a request but before its
+// response reached us. The second successful response is intentionally armed
+// as a mutation trap: a retry would turn this test red and risk a second order.
+func TestTransportErrorsDoNotRetryPlaceOrCancel(t *testing.T) {
+	at := fixedKR(2026, time.September, 2, 10, 0)
+	config := Config{EdgeURL: "http://127.0.0.1:8080", KRSymbol: "005930", KRPrice: "1000"}
+	tests := []struct {
+		name               string
+		failPath           string
+		wantPlaceAttempts  int32
+		wantCancelAttempts int32
+	}{
+		{"place transport error", "/v1/commands", 1, 0},
+		{"cancel transport error", "/v1/commands/cancel", 1, 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var placeAttempts, cancelAttempts atomic.Int32
+			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.URL.Path == "/v1/commands" {
+					attempt := placeAttempts.Add(1)
+					if test.failPath == "/v1/commands" && attempt == 1 {
+						return nil, errors.New("lost place response")
+					}
+					return jsonResponse(`{"disposition":"ACCEPTED"}`), nil
+				}
+				attempt := cancelAttempts.Add(1)
+				if test.failPath == "/v1/commands/cancel" && attempt == 1 {
+					return nil, errors.New("lost cancel response")
+				}
+				return jsonResponse(`{"state":"CANCELLED"}`), nil
+			})}
+			result := execute(context.Background(), config, func() time.Time { return at }, client)
+			if result.Outcome != OutcomeEdgeUnreachable {
+				t.Fatalf("outcome = %q, want %q", result.Outcome, OutcomeEdgeUnreachable)
+			}
+			if got := placeAttempts.Load(); got != test.wantPlaceAttempts {
+				t.Fatalf("place attempts = %d, want %d; retry risks a duplicate order", got, test.wantPlaceAttempts)
+			}
+			if got := cancelAttempts.Load(); got != test.wantCancelAttempts {
+				t.Fatalf("cancel attempts = %d, want %d; retry is forbidden", got, test.wantCancelAttempts)
 			}
 		})
 	}
