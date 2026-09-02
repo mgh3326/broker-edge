@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	executioncontracts "github.com/mgh3326/broker-edge/execution_contracts"
 )
@@ -21,6 +22,9 @@ func NewHandler(service *Service) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", metrics.handler())
 	mux.HandleFunc("POST /v1/commands", func(writer http.ResponseWriter, request *http.Request) {
+		startedAt := time.Now()
+		scope := metricScopeUnknown
+		defer func() { metrics.observeCommandHandler(scope, time.Since(startedAt).Seconds()) }()
 		command, valid := decodeCommand(writer, request)
 		if !valid {
 			writeReceipt(writer, http.StatusBadRequest, receiptForInvalidHTTP(service))
@@ -46,6 +50,7 @@ func NewHandler(service *Service) http.Handler {
 			writeWitnessReceipt(writer, http.StatusOK, receipt)
 			return
 		}
+		scope = command.AccountScope
 		receipt, err := service.Process(request.Context(), command)
 		if err != nil {
 			// Do not expose database or transport details. A persistence failure

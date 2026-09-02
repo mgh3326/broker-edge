@@ -21,13 +21,15 @@ const (
 // Its labels are deliberately closed enums: command payload values never enter
 // a metric label.
 type Metrics struct {
-	registry       *prometheus.Registry
-	commands       *prometheus.CounterVec
-	cancels        *prometheus.CounterVec
-	brokerRequests *prometheus.CounterVec
-	liveCommands   *prometheus.CounterVec
-	missingEcho    prometheus.Gauge
-	httpDuration   *prometheus.HistogramVec
+	registry        *prometheus.Registry
+	commands        *prometheus.CounterVec
+	cancels         *prometheus.CounterVec
+	brokerRequests  *prometheus.CounterVec
+	brokerDuration  *prometheus.HistogramVec
+	commandDuration *prometheus.HistogramVec
+	liveCommands    *prometheus.CounterVec
+	missingEcho     prometheus.Gauge
+	httpDuration    *prometheus.HistogramVec
 }
 
 // NewMetrics creates the bounded metrics surface exported by kis-mock-edge.
@@ -47,6 +49,14 @@ func NewMetrics() *Metrics {
 			Name: "broker_edge_broker_requests_total",
 			Help: "Total broker requests that crossed a durable send boundary.",
 		}, []string{"scope", "kind"}),
+		brokerDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "broker_edge_broker_call_duration_seconds",
+			Help: "Broker HTTP round-trip duration after the durable send boundary.",
+		}, []string{"scope", "tr", "outcome"}),
+		commandDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "broker_edge_command_handler_duration_seconds",
+			Help: "Command handler duration by bounded account scope.",
+		}, []string{"scope"}),
 		liveCommands: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "edge_commands_total",
 			Help: "Total kis_live shadow witness command outcomes.",
@@ -67,6 +77,8 @@ func NewMetrics() *Metrics {
 		metrics.commands,
 		metrics.cancels,
 		metrics.brokerRequests,
+		metrics.brokerDuration,
+		metrics.commandDuration,
 		metrics.liveCommands,
 		metrics.missingEcho,
 		metrics.httpDuration,
@@ -138,6 +150,76 @@ func (metrics *Metrics) recordCancel(scope string, state CancelState) {
 func (metrics *Metrics) recordBrokerRequest(scope, kind string) {
 	if metrics != nil && metrics.brokerRequests != nil {
 		metrics.brokerRequests.WithLabelValues(metricScope(scope), metricRequestKind(kind)).Inc()
+	}
+}
+
+// observeBrokerCall records only the prepared broker Send/SendCancel interval.
+// `tr` is derived from fixed edge routing, never from broker payload values.
+func (metrics *Metrics) observeBrokerCall(scope, tr, outcome string, seconds float64) {
+	if metrics == nil || metrics.brokerDuration == nil {
+		return
+	}
+	metrics.brokerDuration.WithLabelValues(
+		metricScope(scope), metricTR(tr), metricOutcome(outcome),
+	).Observe(seconds)
+}
+
+func (metrics *Metrics) observeCommandHandler(scope string, seconds float64) {
+	if metrics != nil && metrics.commandDuration != nil {
+		metrics.commandDuration.WithLabelValues(metricScope(scope)).Observe(seconds)
+	}
+}
+
+func metricTR(tr string) string {
+	switch tr {
+	case "VTTC0011U", "VTTC0012U", "VTTC0013U", "VTTT1001U", "VTTT1002U", "VTTT1004U", "alpaca_orders":
+		return tr
+	default:
+		return "unknown"
+	}
+}
+
+func metricOutcome(outcome string) string {
+	switch outcome {
+	case "accepted", "cancelled", "not_found", "unknown":
+		return outcome
+	default:
+		return "unknown"
+	}
+}
+
+func metricPlaceTR(command executioncontracts.ExecutionCommandV1) string {
+	switch command.AccountScope {
+	case executioncontracts.AccountScopeKISMock:
+		if command.Side == "buy" {
+			return "VTTC0012U"
+		}
+		if command.Side == "sell" {
+			return "VTTC0011U"
+		}
+	case executioncontracts.AccountScopeKISMockUS:
+		if command.Side == "buy" {
+			return "VTTT1002U"
+		}
+		if command.Side == "sell" {
+			return "VTTT1001U"
+		}
+	case executioncontracts.AccountScopeAlpacaPaperCrypto:
+		return "alpaca_orders"
+	}
+	return "unknown"
+}
+
+func metricCancelTR(scope string) string {
+	switch scope {
+	case executioncontracts.AccountScopeKISMock:
+		return "VTTC0013U"
+	case executioncontracts.AccountScopeKISMockUS:
+		return "VTTT1004U"
+	case executioncontracts.AccountScopeAlpacaPaperCrypto:
+		return "alpaca_orders"
+	default:
+		return "unknown"
 	}
 }
 

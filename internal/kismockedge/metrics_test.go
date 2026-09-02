@@ -85,6 +85,19 @@ func TestMetricsExposeBoundedLabelsWithoutCommandPayload(t *testing.T) {
 		"scope": executioncontracts.AccountScopeAlpacaPaperCrypto,
 		"kind":  metricKindCancel,
 	})
+	assertMetricSample(t, text, "broker_edge_broker_call_duration_seconds_count", map[string]string{
+		"scope":   executioncontracts.AccountScopeAlpacaPaperCrypto,
+		"tr":      "alpaca_orders",
+		"outcome": "accepted",
+	})
+	assertMetricSample(t, text, "broker_edge_broker_call_duration_seconds_count", map[string]string{
+		"scope":   executioncontracts.AccountScopeAlpacaPaperCrypto,
+		"tr":      "alpaca_orders",
+		"outcome": "cancelled",
+	})
+	assertMetricSample(t, text, "broker_edge_command_handler_duration_seconds_count", map[string]string{
+		"scope": executioncontracts.AccountScopeAlpacaPaperCrypto,
+	})
 	if !strings.Contains(text, "broker_edge_http_request_duration_seconds_bucket") ||
 		!strings.Contains(text, "go_goroutines") || !strings.Contains(text, "process_cpu_seconds_total") {
 		t.Fatal("metrics endpoint did not expose HTTP, Go, and process collectors")
@@ -93,7 +106,7 @@ func TestMetricsExposeBoundedLabelsWithoutCommandPayload(t *testing.T) {
 	// Mutant witness: adding command_id (or any order payload field) as a
 	// CounterVec label must turn this test red. The full Prometheus text is
 	// scanned instead of merely inspecting our source declarations.
-	for _, forbidden := range []string{"command_id", "symbol", "price", "quantity"} {
+	for _, forbidden := range []string{"command_id", "symbol", "price", "quantity", "order_no"} {
 		if strings.Contains(text, forbidden+`="`) {
 			t.Fatalf("forbidden metric label %q present in collected text", forbidden)
 		}
