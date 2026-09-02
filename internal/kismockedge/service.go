@@ -165,7 +165,20 @@ func (service *Service) Process(ctx context.Context, command executioncontracts.
 	if metrics := service.metricsSink(); metrics != nil {
 		metrics.recordBrokerRequest(command.AccountScope, metricKindPlace)
 	}
+	brokerStartedAt := time.Now()
 	result := prepared.Send(ctx)
+	if metrics := service.metricsSink(); metrics != nil {
+		outcome := "unknown"
+		if result.Accepted && result.BrokerOrderID != "" {
+			outcome = "accepted"
+		}
+		metrics.observeBrokerCall(
+			command.AccountScope,
+			metricPlaceTR(command),
+			outcome,
+			time.Since(brokerStartedAt).Seconds(),
+		)
+	}
 	if result.Accepted && result.BrokerOrderID != "" {
 		return service.finalize(ctx, command.CommandID, executioncontracts.DispositionAccepted, result.BrokerOrderID, "", result.KRXForwardOrderOrgNo)
 	}

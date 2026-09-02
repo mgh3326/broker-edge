@@ -1,0 +1,37 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "id": 1,
+      "title": "Broker-edge overhead p50 by scope",
+      "type": "timeseries",
+      "targets": [{
+        "expr": "histogram_quantile(0.50, sum by (le, scope) (rate(broker_edge_command_handler_duration_seconds_bucket[5m]))) - histogram_quantile(0.50, sum by (le, scope) (rate(broker_edge_broker_call_duration_seconds_bucket[5m])))",
+        "legendFormat": "{{scope}}",
+        "refId": "A"
+      }]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "id": 2,
+      "title": "Broker-edge overhead p95 by scope",
+      "type": "timeseries",
+      "targets": [{
+        "expr": "histogram_quantile(0.95, sum by (le, scope) (rate(broker_edge_command_handler_duration_seconds_bucket[5m]))) - histogram_quantile(0.95, sum by (le, scope) (rate(broker_edge_broker_call_duration_seconds_bucket[5m])))",
+        "legendFormat": "{{scope}}",
+        "refId": "A"
+      }]
+    }
+  ],
+  "schemaVersion": 41,
+  "tags": ["broker-edge", "performance"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "Broker Edge Performance",
+  "uid": "broker-edge-performance",
+  "version": 1
+}

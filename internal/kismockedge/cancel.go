@@ -77,9 +77,25 @@ func (service *Service) Cancel(ctx context.Context, commandID string) (receipt C
 	if metrics := service.metricsSink(); metrics != nil {
 		metrics.recordBrokerRequest(scope, metricKindCancel)
 	}
+	brokerStartedAt := time.Now()
 	result := prepared.SendCancel(ctx)
 	if !result.State.Valid() {
 		result.State = CancelStateUnknown
+	}
+	if metrics := service.metricsSink(); metrics != nil {
+		outcome := "unknown"
+		switch result.State {
+		case CancelStateCancelled:
+			outcome = "cancelled"
+		case CancelStateNotFound:
+			outcome = "not_found"
+		}
+		metrics.observeBrokerCall(
+			scope,
+			metricCancelTR(scope),
+			outcome,
+			time.Since(brokerStartedAt).Seconds(),
+		)
 	}
 	if result.State == CancelStateNotFound && result.ErrorCode == "" {
 		result.ErrorCode = ErrorCancelNotFound
