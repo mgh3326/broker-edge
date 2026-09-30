@@ -6,6 +6,7 @@ package kismockedge
 // every configured secret before any broker field reaches a receipt.
 
 import (
+	"bytes"
 	"encoding/json"
 	"regexp"
 	"sort"
@@ -18,6 +19,12 @@ import (
 const (
 	// redactedValue replaces every secret-shaped span.
 	redactedValue = "[redacted]"
+
+	// nonStringFieldMarker replaces an rt_cd/msg_cd/msg1 value whose JSON
+	// type is not a string. Serializing objects, arrays, or numbers would
+	// carry escaped secret material past the text masker, so non-string
+	// fields are dropped to this fixed marker instead.
+	nonStringFieldMarker = "<non-string omitted>"
 
 	// maxRejectionCodeLength bounds rt_cd/msg_cd and maxRejectionMsgLength
 	// bounds msg1. Values are masked before they are bounded, so a truncated
@@ -73,13 +80,21 @@ func (masker *secretMasker) maskText(value string, maxRunes int) string {
 	return value
 }
 
+// maskedField passes a broker field through the masker only when the JSON
+// value is a string. Any other JSON type (object, array, number, bool, null)
+// is replaced by a fixed marker: a serialized composite could hide secrets
+// behind \uXXXX escapes that the text masker cannot see.
 func (masker *secretMasker) maskedField(raw json.RawMessage, maxRunes int) string {
-	if len(raw) == 0 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
 		return ""
 	}
+	if trimmed[0] != '"' {
+		return nonStringFieldMarker
+	}
 	var text string
-	if json.Unmarshal(raw, &text) != nil {
-		text = string(raw)
+	if json.Unmarshal(trimmed, &text) != nil {
+		return nonStringFieldMarker
 	}
 	return masker.maskText(text, maxRunes)
 }
