@@ -321,3 +321,17 @@ func readRESPLine(reader *bufio.Reader) (string, error) {
 	}
 	return strings.TrimSuffix(line, "\r\n"), nil
 }
+
+// TTL returns the remaining lifetime; Redis reports missing or persistent keys
+// as negative values, neither of which is a fresh approval record.
+func (client *RedisClient) TTL(ctx context.Context, key string) (time.Duration, error) {
+	reply, err := client.execute(ctx, "PTTL", key)
+	if err != nil || reply.kind != ':' {
+		return 0, errRedisUnavailable
+	}
+	ms, err := strconv.ParseInt(reply.text, 10, 64)
+	if err != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) {
+		return 0, errRedisUnavailable
+	}
+	return time.Duration(ms) * time.Millisecond, nil
+}

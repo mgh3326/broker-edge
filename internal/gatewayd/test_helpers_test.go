@@ -226,3 +226,16 @@ func newTestEnsureServiceForProvider(t *testing.T, store RedisStore, issuer OAut
 func testGatewayNow() time.Time {
 	return time.Unix(2_000_000_000, 0)
 }
+
+func (store *fakeRedisStore) TTL(_ context.Context, key string) (time.Duration, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.getErr != nil {
+		return 0, store.getErr
+	}
+	v, ok := store.values[key]
+	if !ok || v.expiresAt.IsZero() {
+		return -1, nil
+	}
+	return v.expiresAt.Sub(store.now()), nil
+}
