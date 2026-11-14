@@ -19,9 +19,9 @@ func isApprovalProvider(p TokenProvider) bool {
 
 type approvalStore interface {
 	RedisStore
-	// Fresh atomically reports whether key holds a value whose remaining TTL
-	// exceeds minTTL; the value itself is never read out of Redis.
-	Fresh(ctx context.Context, key string, minTTL time.Duration) (bool, error)
+	// TTL returns the key's remaining lifetime; negative when absent, so one
+	// PTTL answers presence and freshness atomically.
+	TTL(ctx context.Context, key string) (time.Duration, error)
 	// Held reports whether key exists, used to observe the issuance lock.
 	Held(ctx context.Context, key string) (bool, error)
 }
@@ -44,12 +44,12 @@ func newApprovalService(store approvalStore, config ProviderConfig, timeout time
 	return &approvalService{store: store, config: config, issuer: approvalIssuer{config: config, timeout: timeout}, cacheKey: prefix, lockKey: prefix + ":lock"}, nil
 }
 
-func (s *approvalService) fresh(ctx context.Context) (bool, error) {
-	fresh, err := s.store.Fresh(ctx, s.cacheKey, tokenExpiryBuffer)
+func (s *approvalService) cachedTTL(ctx context.Context) (time.Duration, error) {
+	ttl, err := s.store.TTL(ctx, s.cacheKey)
 	if err != nil {
-		return false, errEnsureUnavailable
+		return 0, errEnsureUnavailable
 	}
-	return fresh, nil
+	return ttl, nil
 }
 func (s *approvalService) Ensure(ctx context.Context) (EnsureState, error) {
 	return s.ensure(ctx, false)
@@ -58,11 +58,11 @@ func (s *approvalService) EnsureForce(ctx context.Context) (EnsureState, error) 
 	return s.ensure(ctx, true)
 }
 func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, error) {
-	fresh, err := s.fresh(ctx)
+	ttl0, err := s.cachedTTL(ctx)
 	if err != nil {
 		return "", err
 	}
-	if fresh && !force {
+	if ttl0 > tokenExpiryBuffer && !force {
 		return EnsureStateFresh, nil
 	}
 	lock, err := newLockValue()
@@ -85,27 +85,40 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 			if err != nil {
 				return "", errEnsureUnavailable
 			}
-			fresh, err := s.fresh(ctx)
+			ttl, err := s.cachedTTL(ctx)
 			if err != nil {
 				return "", err
 			}
-			// A forced refresh is complete once the lock holder releases the
-			// lock; the published key may be identical to the previous one.
-			if fresh && (!force || !held) {
+			// A republish after our first sample pushes the TTL back up;
+			// that is the evidence a refresh completed even when the stored
+			// key is identical to the previous one.
+			if ttl > tokenExpiryBuffer && (!force || ttl > ttl0) {
 				return EnsureStateFresh, nil
+			}
+			if !held {
+				// The holder is gone without evidence of a publish, so it
+				// failed before replacing the key. Take over issuance instead
+				// of accepting the previous record as a forced refresh.
+				reacquired, err := s.store.SetNX(ctx, s.lockKey, lock, approvalLockTTL)
+				if err != nil {
+					return "", errEnsureUnavailable
+				}
+				if reacquired {
+					break
+				}
 			}
 			select {
 			case <-ctx.Done():
 				return "", errEnsureUnavailable
 			case <-deadline.C:
-				// A fresh record at the deadline means a refresh completed but
-				// its lock lingered (failed release or a dead holder); the
-				// published key is valid, so the wait succeeded.
-				fresh, err := s.fresh(ctx)
+				// A fresh record at the deadline means a refresh completed
+				// with a lingering lock; the published key is valid, so the
+				// wait succeeded.
+				ttl, err := s.cachedTTL(ctx)
 				if err != nil {
 					return "", err
 				}
-				if fresh {
+				if ttl > tokenExpiryBuffer {
 					return EnsureStateFresh, nil
 				}
 				return "", errLockWaitTimeout
@@ -118,11 +131,11 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 		defer cancel()
 		_ = s.store.CompareAndDelete(c, s.lockKey, lock)
 	}()
-	fresh, err = s.fresh(ctx)
+	ttl, err := s.cachedTTL(ctx)
 	if err != nil {
 		return "", err
 	}
-	if fresh && !force {
+	if ttl > tokenExpiryBuffer && !force {
 		return EnsureStateFresh, nil
 	}
 	issued, err := s.issuer.Issue(ctx, s.config.AppKey, s.config.AppSecret)

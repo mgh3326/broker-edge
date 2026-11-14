@@ -227,17 +227,17 @@ func testGatewayNow() time.Time {
 	return time.Unix(2_000_000_000, 0)
 }
 
-func (store *fakeRedisStore) Fresh(_ context.Context, key string, minTTL time.Duration) (bool, error) {
+func (store *fakeRedisStore) TTL(_ context.Context, key string) (time.Duration, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.getErr != nil {
-		return false, store.getErr
+		return 0, store.getErr
 	}
 	v, ok := store.values[key]
 	if !ok || v.expiresAt.IsZero() {
-		return false, nil
+		return -1, nil
 	}
-	return v.expiresAt.Sub(store.now()) > minTTL, nil
+	return v.expiresAt.Sub(store.now()), nil
 }
 
 func (store *fakeRedisStore) Held(_ context.Context, key string) (bool, error) {

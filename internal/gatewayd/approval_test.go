@@ -137,13 +137,15 @@ func TestApprovalForceWaitSameValue(t *testing.T) {
 	s, _ := newApprovalService(store, testProviderConfig(ProviderKISLiveApproval), time.Second)
 	store.save(s.cacheKey, "same-key", approvalTTL)
 	// Another issuer (gatewayd or the Python manager) holds the lock and is
-	// about to re-store the identical still-valid approval key.
+	// about to re-store the identical still-valid approval key. The SET
+	// pushes the expiry out, which is the waiter's evidence a publish
+	// happened.
 	if _, err := store.SetNX(context.Background(), s.lockKey, "other-holder", approvalLockTTL); err != nil {
 		t.Fatal(err)
 	}
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		store.save(s.cacheKey, "same-key", approvalTTL)
+		store.save(s.cacheKey, "same-key", approvalTTL+time.Second)
 		_ = store.CompareAndDelete(context.Background(), s.lockKey, "other-holder")
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -154,17 +156,44 @@ func TestApprovalForceWaitSameValue(t *testing.T) {
 	}
 }
 
+func TestApprovalForceWaitFailedHolder(t *testing.T) {
+	store := newFakeRedisStore(testGatewayNow)
+	s, _ := newApprovalService(store, testProviderConfig(ProviderKISLiveApproval), time.Second)
+	store.save(s.cacheKey, "old-key", approvalTTL)
+	// The holder fails before publishing, then releases the lock. The waiter
+	// must not accept the old record as a forced refresh; it takes over and
+	// issues a replacement itself.
+	if _, err := store.SetNX(context.Background(), s.lockKey, "failed-holder", approvalLockTTL); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = store.CompareAndDelete(context.Background(), s.lockKey, "failed-holder")
+	}()
+	issuer := &fakeOAuthIssuer{token: OAuthToken{AccessToken: "self-issued"}}
+	s.issuer = issuer
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state, err := s.EnsureForce(ctx)
+	if err != nil || state != EnsureStateIssued || issuer.callCount() != 1 {
+		t.Fatalf("force wait = %s, %v, calls %d", state, err, issuer.callCount())
+	}
+}
+
 func TestApprovalForceWaitDeadHolder(t *testing.T) {
 	var mu sync.Mutex
 	now := testGatewayNow()
 	store := newFakeRedisStore(func() time.Time { mu.Lock(); defer mu.Unlock(); return now })
 	s, _ := newApprovalService(store, testProviderConfig(ProviderKISLiveApproval), time.Second)
-	// The holder published the fresh key, then died without releasing the
-	// lock; the lock only disappears when its TTL expires.
-	store.save(s.cacheKey, "fresh-key", approvalTTL)
+	// The holder died holding the lock before any publish could be observed;
+	// the lock only disappears when its TTL expires, then the waiter takes
+	// over issuance.
+	store.save(s.cacheKey, "old-key", approvalTTL)
 	if _, err := store.SetNX(context.Background(), s.lockKey, "dead-holder", approvalLockTTL); err != nil {
 		t.Fatal(err)
 	}
+	issuer := &fakeOAuthIssuer{token: OAuthToken{AccessToken: "self-issued"}}
+	s.issuer = issuer
 	go func() {
 		time.Sleep(300 * time.Millisecond)
 		mu.Lock()
@@ -174,8 +203,8 @@ func TestApprovalForceWaitDeadHolder(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	state, err := s.EnsureForce(ctx)
-	if err != nil || state != EnsureStateFresh {
-		t.Fatalf("force wait = %s, %v", state, err)
+	if err != nil || state != EnsureStateIssued || issuer.callCount() != 1 {
+		t.Fatalf("force wait = %s, %v, calls %d", state, err, issuer.callCount())
 	}
 }
 

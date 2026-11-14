@@ -155,17 +155,6 @@ func (client *RedisClient) CompareAndDelete(ctx context.Context, key, value stri
 	return nil
 }
 
-// Fresh reports in one round trip whether key holds a value whose remaining
-// TTL exceeds minTTL. The cached value never leaves Redis.
-func (client *RedisClient) Fresh(ctx context.Context, key string, minTTL time.Duration) (bool, error) {
-	const freshScript = "local v = redis.call('GET', KEYS[1]); if (not v) or (redis.call('PTTL', KEYS[1]) <= tonumber(ARGV[1])) then return 0 end; return 1"
-	reply, err := client.execute(ctx, "EVAL", freshScript, "1", key, strconv.FormatInt(minTTL.Milliseconds(), 10))
-	if err != nil || reply.kind != ':' {
-		return false, errRedisUnavailable
-	}
-	return reply.text == "1", nil
-}
-
 // Held reports whether key exists; the approval lock-wait loop uses it to
 // detect that the lock holder finished, regardless of the value it stored.
 func (client *RedisClient) Held(ctx context.Context, key string) (bool, error) {
