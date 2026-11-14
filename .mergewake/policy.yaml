@@ -1,0 +1,30 @@
+version: 1
+# broker-edge joins mergewake (operator-desk 2026-11-14, ESC at-design-be29-no-mergewake option A).
+# Merge review and deployment approval are separate controls. Blocking paths below
+# keep two review passes (correctness + state-risk); they also hold a rollout for
+# a human decision under deploy_approval.
+enabled: true
+# The `ci` workflow's PR jobs. `image` runs on push only.
+required_checks:
+  - go
+  - secrets
+watch_checks:
+  - go
+  - secrets
+blocking:
+  - paths:
+      - 'internal/kismockedge/**'
+      - 'cmd/kis-mock-edge/**'
+      - 'execution_contracts/**'
+    reason: The placement edge sends paper/demo orders to KIS VTS and Alpaca paper; a revert does not undo a sent order.
+  - paths:
+      - 'internal/kislive/**'
+      - 'internal/gatewayd/**'
+      - 'cmd/gatewayd/**'
+    reason: Live-account witness and broker token issuance (gatewayd owns KIS/Toss OAuth for the production fleet); a wrong token publish or invalidation breaks live sessions before a revert.
+review_gate:
+  land: graded
+
+deploy_approval:
+  - paths: ['deploy/**', 'internal/gatewayd/**', 'cmd/gatewayd/**', 'internal/kismockedge/**', 'cmd/kis-mock-edge/**', 'internal/kislive/**', 'execution_contracts/**']
+    reason: Host units and processes that hold broker credentials or send orders; rollout needs an operator decision.
