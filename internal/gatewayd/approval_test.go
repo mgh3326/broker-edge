@@ -131,6 +131,28 @@ func TestApprovalConcurrentAndHTTP(t *testing.T) {
 	}
 }
 
+func TestApprovalForceWaitSameValue(t *testing.T) {
+	store := newFakeRedisStore(testGatewayNow)
+	s, _ := newApprovalService(store, testProviderConfig(ProviderKISLiveApproval), time.Second)
+	store.save(s.cacheKey, "same-key", approvalTTL)
+	// Another issuer (gatewayd or the Python manager) holds the lock and is
+	// about to re-store the identical still-valid approval key.
+	if _, err := store.SetNX(context.Background(), s.lockKey, "other-holder", approvalLockTTL); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		store.save(s.cacheKey, "same-key", approvalTTL)
+		_ = store.CompareAndDelete(context.Background(), s.lockKey, "other-holder")
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state, err := s.EnsureForce(ctx)
+	if err != nil || state != EnsureStateFresh {
+		t.Fatalf("force wait = %s, %v", state, err)
+	}
+}
+
 type approvalRoundTrip func(*http.Request) (*http.Response, error)
 
 func (f approvalRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

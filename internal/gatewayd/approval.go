@@ -19,7 +19,11 @@ func isApprovalProvider(p TokenProvider) bool {
 
 type approvalStore interface {
 	RedisStore
-	TTL(context.Context, string) (time.Duration, error)
+	// Fresh atomically reports whether key holds a value whose remaining TTL
+	// exceeds minTTL; the value itself is never read out of Redis.
+	Fresh(ctx context.Context, key string, minTTL time.Duration) (bool, error)
+	// Held reports whether key exists, used to observe the issuance lock.
+	Held(ctx context.Context, key string) (bool, error)
 }
 
 type approvalService struct {
@@ -40,19 +44,12 @@ func newApprovalService(store approvalStore, config ProviderConfig, timeout time
 	return &approvalService{store: store, config: config, issuer: approvalIssuer{config: config, timeout: timeout}, cacheKey: prefix, lockKey: prefix + ":lock"}, nil
 }
 
-func (s *approvalService) cached(ctx context.Context) (string, bool, error) {
-	value, present, err := s.store.Get(ctx, s.cacheKey)
+func (s *approvalService) fresh(ctx context.Context) (bool, error) {
+	fresh, err := s.store.Fresh(ctx, s.cacheKey, tokenExpiryBuffer)
 	if err != nil {
-		return "", false, errEnsureUnavailable
+		return false, errEnsureUnavailable
 	}
-	if !present || strings.TrimSpace(value) == "" {
-		return "", false, nil
-	}
-	ttl, err := s.store.TTL(ctx, s.cacheKey)
-	if err != nil {
-		return "", false, errEnsureUnavailable
-	}
-	return value, ttl > tokenExpiryBuffer, nil
+	return fresh, nil
 }
 func (s *approvalService) Ensure(ctx context.Context) (EnsureState, error) {
 	return s.ensure(ctx, false)
@@ -61,7 +58,7 @@ func (s *approvalService) EnsureForce(ctx context.Context) (EnsureState, error) 
 	return s.ensure(ctx, true)
 }
 func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, error) {
-	old, fresh, err := s.cached(ctx)
+	fresh, err := s.fresh(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -82,11 +79,17 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
 		for {
-			value, valid, err := s.cached(ctx)
+			held, err := s.store.Held(ctx, s.lockKey)
+			if err != nil {
+				return "", errEnsureUnavailable
+			}
+			fresh, err := s.fresh(ctx)
 			if err != nil {
 				return "", err
 			}
-			if valid && (!force || value != old) {
+			// A forced refresh is complete once the lock holder releases the
+			// lock; the published key may be identical to the previous one.
+			if fresh && (!force || !held) {
 				return EnsureStateFresh, nil
 			}
 			select {
@@ -103,7 +106,7 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 		defer cancel()
 		_ = s.store.CompareAndDelete(c, s.lockKey, lock)
 	}()
-	_, fresh, err = s.cached(ctx)
+	fresh, err = s.fresh(ctx)
 	if err != nil {
 		return "", err
 	}

@@ -102,6 +102,67 @@ func TestRedisClientUsesGETSetNXEXAndOwnedRelease(t *testing.T) {
 	}
 }
 
+func TestRedisClientFreshAndHeld(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	commands := make(chan []string, 2)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(commands)
+		for range 2 {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			reader := bufio.NewReader(connection)
+			writer := bufio.NewWriter(connection)
+			arguments, readErr := readTestRESPArray(reader)
+			if readErr == nil {
+				commands <- arguments
+				_, _ = writer.WriteString(":1\r\n")
+				_ = writer.Flush()
+			}
+			_ = connection.Close()
+		}
+	}()
+
+	client, err := NewRedisClient("redis://" + listener.Addr().String() + "/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := client.Fresh(context.Background(), "cache-key", time.Minute)
+	if err != nil || !fresh {
+		t.Fatalf("Fresh = %t, %v", fresh, err)
+	}
+	held, err := client.Held(context.Background(), "lock-key")
+	if err != nil || !held {
+		t.Fatalf("Held = %t, %v", held, err)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fake Redis did not finish")
+	}
+
+	got := make([][]string, 0, 2)
+	for command := range commands {
+		got = append(got, command)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Redis commands = %d, want 2", len(got))
+	}
+	if len(got[0]) != 5 || got[0][0] != "EVAL" || got[0][2] != "1" || got[0][3] != "cache-key" || got[0][4] != "60000" {
+		t.Fatalf("fresh command = %q", got[0])
+	}
+	if !sameStrings(got[1], []string{"EXISTS", "lock-key"}) {
+		t.Fatalf("held command = %q", got[1])
+	}
+}
+
 func readTestRESPArray(reader *bufio.Reader) ([]string, error) {
 	marker, err := reader.ReadByte()
 	if err != nil || marker != '*' {
