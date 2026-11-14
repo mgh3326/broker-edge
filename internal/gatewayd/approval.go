@@ -73,6 +73,10 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 	if err != nil {
 		return "", errEnsureUnavailable
 	}
+	// Publish evidence is a TTL increase over the previously observed sample:
+	// a republish SET resets the expiry to ~approvalTTL, while a record that
+	// only decays never moves upward.
+	prevTTL := ttl0
 	if !acquired {
 		// The wait outlives approvalLockTTL so a lock whose holder died before
 		// releasing it expires before the waiter gives up.
@@ -89,10 +93,7 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 			if err != nil {
 				return "", err
 			}
-			// A republish after our first sample pushes the TTL back up;
-			// that is the evidence a refresh completed even when the stored
-			// key is identical to the previous one.
-			if ttl > tokenExpiryBuffer && (!force || ttl > ttl0) {
+			if ttl > tokenExpiryBuffer && (!force || ttl > prevTTL) {
 				return EnsureStateFresh, nil
 			}
 			if !held {
@@ -107,6 +108,7 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 					break
 				}
 			}
+			prevTTL = ttl
 			select {
 			case <-ctx.Done():
 				return "", errEnsureUnavailable
@@ -131,11 +133,14 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 		defer cancel()
 		_ = s.store.CompareAndDelete(c, s.lockKey, lock)
 	}()
+	// A publish may have landed between the last Held() observation and our
+	// SetNX (or between the first sample and a direct acquire); skip issuance
+	// when the TTL moved up in that gap.
 	ttl, err := s.cachedTTL(ctx)
 	if err != nil {
 		return "", err
 	}
-	if ttl > tokenExpiryBuffer && !force {
+	if ttl > tokenExpiryBuffer && (!force || ttl > prevTTL) {
 		return EnsureStateFresh, nil
 	}
 	issued, err := s.issuer.Issue(ctx, s.config.AppKey, s.config.AppSecret)

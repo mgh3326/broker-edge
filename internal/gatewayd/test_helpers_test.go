@@ -35,6 +35,7 @@ type fakeRedisStore struct {
 	setWhileLockHeld []bool
 	setNXCalls       int
 	setNXHit         chan struct{}
+	setNXHook        func()
 }
 
 func newFakeRedisStore(now func() time.Time) *fakeRedisStore {
@@ -81,6 +82,9 @@ func (store *fakeRedisStore) hasActiveLockLocked() bool {
 }
 
 func (store *fakeRedisStore) SetNX(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
+	if hook := store.setNXHook; hook != nil {
+		hook()
+	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.setNXErr != nil {

@@ -208,6 +208,35 @@ func TestApprovalForceWaitDeadHolder(t *testing.T) {
 	}
 }
 
+func TestApprovalForceWaitGapPublish(t *testing.T) {
+	store := newFakeRedisStore(testGatewayNow)
+	s, _ := newApprovalService(store, testProviderConfig(ProviderKISLiveApproval), time.Second)
+	store.save(s.cacheKey, "old-key", approvalTTL)
+	if _, err := store.SetNX(context.Background(), s.lockKey, "failed-holder", approvalLockTTL); err != nil {
+		t.Fatal(err)
+	}
+	// On the takeover reacquire (the third SetNX), a co-tenant publish lands
+	// in the Held→SetNX gap; the post-acquire TTL recheck must observe it and
+	// skip issuance instead of overwriting the fresh record.
+	store.setNXHook = func() {
+		if store.setNXCalls == 2 {
+			store.save(s.cacheKey, "gap-published", approvalTTL+time.Second)
+		}
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		_ = store.CompareAndDelete(context.Background(), s.lockKey, "failed-holder")
+	}()
+	issuer := &fakeOAuthIssuer{token: OAuthToken{AccessToken: "unneeded"}}
+	s.issuer = issuer
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state, err := s.EnsureForce(ctx)
+	if err != nil || state != EnsureStateFresh || issuer.callCount() != 0 {
+		t.Fatalf("force wait = %s, %v, calls %d", state, err, issuer.callCount())
+	}
+}
+
 type approvalRoundTrip func(*http.Request) (*http.Response, error)
 
 func (f approvalRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
