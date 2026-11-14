@@ -26,5 +26,5 @@ review_gate:
   land: graded
 
 deploy_approval:
-  - paths: ['deploy/**', 'internal/gatewayd/**', 'cmd/gatewayd/**', 'internal/kismockedge/**', 'cmd/kis-mock-edge/**']
+  - paths: ['deploy/**', 'internal/gatewayd/**', 'cmd/gatewayd/**', 'internal/kismockedge/**', 'cmd/kis-mock-edge/**', 'internal/kislive/**', 'execution_contracts/**']
     reason: Host units and processes that hold broker credentials or send orders; rollout needs an operator decision.
