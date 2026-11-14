@@ -74,7 +74,9 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 		return "", errEnsureUnavailable
 	}
 	if !acquired {
-		deadline := time.NewTimer(12 * time.Second)
+		// The wait outlives approvalLockTTL so a lock whose holder died before
+		// releasing it expires before the waiter gives up.
+		deadline := time.NewTimer(approvalLockTTL + 5*time.Second)
 		defer deadline.Stop()
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
@@ -96,6 +98,16 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 			case <-ctx.Done():
 				return "", errEnsureUnavailable
 			case <-deadline.C:
+				// A fresh record at the deadline means a refresh completed but
+				// its lock lingered (failed release or a dead holder); the
+				// published key is valid, so the wait succeeded.
+				fresh, err := s.fresh(ctx)
+				if err != nil {
+					return "", err
+				}
+				if fresh {
+					return EnsureStateFresh, nil
+				}
 				return "", errLockWaitTimeout
 			case <-ticker.C:
 			}

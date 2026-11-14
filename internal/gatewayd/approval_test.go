@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -144,6 +145,31 @@ func TestApprovalForceWaitSameValue(t *testing.T) {
 		time.Sleep(300 * time.Millisecond)
 		store.save(s.cacheKey, "same-key", approvalTTL)
 		_ = store.CompareAndDelete(context.Background(), s.lockKey, "other-holder")
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state, err := s.EnsureForce(ctx)
+	if err != nil || state != EnsureStateFresh {
+		t.Fatalf("force wait = %s, %v", state, err)
+	}
+}
+
+func TestApprovalForceWaitDeadHolder(t *testing.T) {
+	var mu sync.Mutex
+	now := testGatewayNow()
+	store := newFakeRedisStore(func() time.Time { mu.Lock(); defer mu.Unlock(); return now })
+	s, _ := newApprovalService(store, testProviderConfig(ProviderKISLiveApproval), time.Second)
+	// The holder published the fresh key, then died without releasing the
+	// lock; the lock only disappears when its TTL expires.
+	store.save(s.cacheKey, "fresh-key", approvalTTL)
+	if _, err := store.SetNX(context.Background(), s.lockKey, "dead-holder", approvalLockTTL); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		mu.Lock()
+		now = now.Add(approvalLockTTL + time.Second)
+		mu.Unlock()
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
