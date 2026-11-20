@@ -53,6 +53,13 @@ func TestParseFetchConsumers(t *testing.T) {
 		"duplicate name":        `{"consumers":[{"name":"a","credential_sha256":"` + digest + `","providers":["toss"]},{"name":"a","credential_sha256":"` + credentialDigest(credentialOther) + `","providers":["toss"]}]}`,
 		"duplicate credential":  `{"consumers":[{"name":"a","credential_sha256":"` + digest + `","providers":["toss"]},{"name":"b","credential_sha256":"` + digest + `","providers":["toss"]}]}`,
 		"trailing data":         valid + ` {}`,
+		"null file":             `null`,
+		"empty object":          `{}`,
+		"null consumers":        `{"consumers":null}`,
+		"sha plus empty env":    `{"consumers":[{"name":"a","credential_sha256":"` + digest + `","credential_env":"","providers":["toss"]}]}`,
+		"empty sha":             `{"consumers":[{"name":"a","credential_sha256":"","providers":["toss"]}]}`,
+		"empty env name":        `{"consumers":[{"name":"a","credential_env":"","providers":["toss"]}]}`,
+		"null sha":              `{"consumers":[{"name":"a","credential_sha256":null,"providers":["toss"]}]}`,
 		"not json":              `consumers`,
 	}
 	for name, config := range bad {
