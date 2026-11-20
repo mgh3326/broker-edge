@@ -92,6 +92,7 @@ func NewEnsureServiceForProvider(store RedisStore, oauth OAuthIssuer, config Pro
 		AppKey:          config.AppKey,
 		AppSecret:       config.AppSecret,
 		Now:             time.Now,
+		memory:          newTokenMemory(),
 		InitialLockWait: providerInitialLockWait(config.Provider),
 		LockPollEvery:   providerLockPollInterval(config.Provider),
 		LockWaitTimeout: providerLockWaitTimeout(config.Provider),

@@ -124,6 +124,9 @@ type Fetcher struct {
 // NewFetcher builds the /fetch capability for this provider. It shares the
 // service's memory so an /ensure-driven issue is visible to /fetch.
 func (service *EnsureService) NewFetcher() *Fetcher {
+	if service.memory == nil {
+		service.memory = newTokenMemory()
+	}
 	return &Fetcher{
 		Store:           service.Store,
 		backend:         service,
