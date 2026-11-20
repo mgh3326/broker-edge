@@ -54,6 +54,10 @@ type EnsureService struct {
 	AppSecret string
 	Now       func() time.Time
 
+	// memory is this provider's in-process token copy, shared with the /fetch
+	// Fetcher. It is nil-safe and never read by /ensure.
+	memory *tokenMemory
+
 	InitialLockWait time.Duration
 	LockPollEvery   time.Duration
 	LockWaitTimeout time.Duration
@@ -156,21 +160,33 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 	if fresh {
 		return EnsureStateFresh, nil
 	}
-	issued, err := service.OAuth.Issue(ctx, service.AppKey, service.AppSecret)
-	if err != nil || !validIssuedToken(issued, providerTokenExpiryBuffer(service.Provider)) {
-		return "", errEnsureUnavailable
-	}
-	payload, err := service.payload(issued.AccessToken, issued.ExpiresIn, service.now())
+	issuedToken, err := service.issueAndStore(ctx)
 	if err != nil {
 		return "", errEnsureUnavailable
+	}
+	service.memory.put(issuedToken)
+	return EnsureStateIssued, nil
+}
+
+// issueAndStore performs one OAuth issue and writes Redis (same key, payload and
+// TTL as always). The caller owns the provider's Redis lock.
+func (service *EnsureService) issueAndStore(ctx context.Context) (FetchedToken, error) {
+	issued, err := service.OAuth.Issue(ctx, service.AppKey, service.AppSecret)
+	if err != nil || !validIssuedToken(issued, providerTokenExpiryBuffer(service.Provider)) {
+		return FetchedToken{}, errEnsureUnavailable
+	}
+	now := service.now()
+	payload, err := service.payload(issued.AccessToken, issued.ExpiresIn, now)
+	if err != nil {
+		return FetchedToken{}, errEnsureUnavailable
 	}
 	// Toss permits one valid token per client. A successful reissue invalidates
 	// the previous token, so publish the replacement while still owning this
 	// shared lock before any Python consumer can observe an unlocked stale key.
 	if err := service.Store.Set(ctx, service.CacheKey, payload, providerCacheTTL(service.Provider, issued.ExpiresIn)); err != nil {
-		return "", errEnsureUnavailable
+		return FetchedToken{}, errEnsureUnavailable
 	}
-	return EnsureStateIssued, nil
+	return newFetchedToken(issued.AccessToken, now.Add(time.Duration(issued.ExpiresIn)*time.Second)), nil
 }
 
 func (service *EnsureService) payload(accessToken string, expiresIn int64, now time.Time) (string, error) {

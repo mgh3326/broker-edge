@@ -26,6 +26,12 @@ func NewHandler(ensurers ProviderEnsurers, logger EventLogger) http.Handler {
 }
 
 func newHandler(ensurers ProviderEnsurers, logger EventLogger, metrics *Metrics) http.Handler {
+	return newHandlerWithFetch(ensurers, FetchOptions{}, logger, metrics)
+}
+
+// newHandlerWithFetch adds POST /v1/tokens/{provider}/fetch. /ensure, /healthz
+// and /metrics are unchanged and never consult the fetch options.
+func newHandlerWithFetch(ensurers ProviderEnsurers, fetch FetchOptions, logger EventLogger, metrics *Metrics) http.Handler {
 	if metrics == nil {
 		metrics = NewMetrics()
 	}
@@ -34,6 +40,7 @@ func newHandler(ensurers ProviderEnsurers, logger EventLogger, metrics *Metrics)
 	mux.HandleFunc("GET /healthz", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, `{"status":"ok"}`)
 	})
+	mux.HandleFunc("POST /v1/tokens/{provider}/fetch", fetchHandler(fetch, logger, metrics))
 	mux.HandleFunc("POST /v1/tokens/{provider}/ensure", func(writer http.ResponseWriter, request *http.Request) {
 		provider := TokenProvider(request.PathValue("provider"))
 		if !knownProvider(provider) {

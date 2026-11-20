@@ -73,25 +73,48 @@ func Run(ctx context.Context, args []string, lookup func(string) string, stderr 
 		writeStartupError(stderr)
 		return 1
 	}
+	if lookup == nil {
+		lookup = func(string) string { return "" }
+	}
+	consumers, err := LoadFetchConsumers(lookup(FetchConsumersFileEnv), lookup)
+	if err != nil {
+		writeStartupError(stderr)
+		return 1
+	}
 	ensurers := make(ProviderEnsurers, len(options.Providers))
+	fetchers := make(ProviderFetchers, len(options.Providers))
 	for _, provider := range options.Providers {
 		providerConfig, found := config.providerConfig(provider)
 		if !found {
 			writeStartupError(stderr)
 			return 1
 		}
-		var ensurer Ensurer
-		var ensureErr error
 		if isApprovalProvider(provider) {
-			ensurer, ensureErr = newApprovalService(store, providerConfig, config.Timeout)
+			service, ensureErr := newApprovalService(store, providerConfig, config.Timeout)
+			if ensureErr != nil {
+				writeStartupError(stderr)
+				return 1
+			}
+			ensurers[provider], fetchers[provider] = service, service.newFetcher()
 		} else {
-			ensurer, ensureErr = NewEnsureServiceForProvider(store, oauthIssuerFor(providerConfig, config.Timeout), providerConfig)
+			service, ensureErr := NewEnsureServiceForProvider(store, oauthIssuerFor(providerConfig, config.Timeout), providerConfig)
+			if ensureErr != nil {
+				writeStartupError(stderr)
+				return 1
+			}
+			ensurers[provider], fetchers[provider] = service, service.NewFetcher()
 		}
-		if ensureErr != nil {
-			writeStartupError(stderr)
-			return 1
+	}
+	// Restart must not force a reissue: load each provider's current Redis token
+	// into memory (read only; Warm never issues).
+	if consumers.Enabled() {
+		warmContext, cancelWarm := context.WithTimeout(ctx, config.Timeout)
+		for _, fetcher := range fetchers {
+			if warmable, ok := fetcher.(interface{ Warm(context.Context) }); ok {
+				warmable.Warm(warmContext)
+			}
 		}
-		ensurers[provider] = ensurer
+		cancelWarm()
 	}
 	listener, err := net.Listen("tcp", config.ListenAddress)
 	if err != nil {
@@ -101,7 +124,7 @@ func Run(ctx context.Context, args []string, lookup func(string) string, stderr 
 	logger := log.New(stderr, "", 0)
 	metrics := NewMetrics()
 	server := &http.Server{
-		Handler:           newHandler(ensurers, logger, metrics),
+		Handler:           newHandlerWithFetch(ensurers, FetchOptions{Fetchers: fetchers, Auth: consumers}, logger, metrics),
 		ErrorLog:          log.New(io.Discard, "", 0),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       30 * time.Second,

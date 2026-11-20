@@ -31,6 +31,9 @@ type approvalService struct {
 	config            ProviderConfig
 	issuer            OAuthIssuer
 	cacheKey, lockKey string
+	memory            *tokenMemory
+	// now is the clock for expiry bookkeeping only; tests replace it.
+	now func() time.Time
 }
 
 func newApprovalService(store approvalStore, config ProviderConfig, timeout time.Duration) (*approvalService, error) {
@@ -41,7 +44,7 @@ func newApprovalService(store approvalStore, config ProviderConfig, timeout time
 	if config.Provider == ProviderKISMockApproval {
 		prefix = "kis_mock:websocket:approval_key"
 	}
-	return &approvalService{store: store, config: config, issuer: approvalIssuer{config: config, timeout: timeout}, cacheKey: prefix, lockKey: prefix + ":lock"}, nil
+	return &approvalService{store: store, config: config, issuer: approvalIssuer{config: config, timeout: timeout}, cacheKey: prefix, lockKey: prefix + ":lock", memory: newTokenMemory(), now: time.Now}, nil
 }
 
 func (s *approvalService) cachedTTL(ctx context.Context) (time.Duration, error) {
@@ -143,14 +146,25 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 	if ttl > tokenExpiryBuffer && (!force || ttl > prevTTL) {
 		return EnsureStateFresh, nil
 	}
+	issuedToken, err := s.issueAndStore(ctx)
+	if err != nil {
+		return "", errEnsureUnavailable
+	}
+	s.memory.put(issuedToken)
+	return EnsureStateIssued, nil
+}
+
+// issueAndStore performs one approval-key issue and writes Redis (raw key,
+// 23 h TTL) exactly as /ensure does. The caller owns the issuance lock.
+func (s *approvalService) issueAndStore(ctx context.Context) (FetchedToken, error) {
 	issued, err := s.issuer.Issue(ctx, s.config.AppKey, s.config.AppSecret)
 	if err != nil || strings.TrimSpace(issued.AccessToken) == "" {
-		return "", errEnsureUnavailable
+		return FetchedToken{}, errEnsureUnavailable
 	}
 	if err := s.store.Set(ctx, s.cacheKey, issued.AccessToken, approvalTTL); err != nil {
-		return "", errEnsureUnavailable
+		return FetchedToken{}, errEnsureUnavailable
 	}
-	return EnsureStateIssued, nil
+	return newFetchedToken(issued.AccessToken, s.now().Add(approvalTTL)), nil
 }
 
 type approvalIssuer struct {
