@@ -184,15 +184,31 @@ type fetchHarness struct {
 	cacheKey, lockKey string
 	provider          TokenProvider
 	ensurer           Ensurer
+	// clockMu guards now against hooks that advance it while goroutines read it.
+	clockMu sync.RWMutex
 	// writeRedis puts another issuer's token into Redis the way its Python
 	// writer would.
 	writeRedis func(token string, expiresIn int64)
 }
 
+// clock is the harness's fake clock, safe for concurrent readers.
+func (h *fetchHarness) clock() time.Time {
+	h.clockMu.RLock()
+	defer h.clockMu.RUnlock()
+	return h.now
+}
+
+// advance moves the fake clock forward from any goroutine.
+func (h *fetchHarness) advance(d time.Duration) {
+	h.clockMu.Lock()
+	h.now = h.now.Add(d)
+	h.clockMu.Unlock()
+}
+
 func newFetchHarness(t *testing.T, provider TokenProvider) *fetchHarness {
 	t.Helper()
 	h := &fetchHarness{t: t, now: testGatewayNow(), issuer: &seqIssuer{}, provider: provider}
-	clock := func() time.Time { return h.now }
+	clock := h.clock
 	h.store = &countingStore{fakeRedisStore: newFakeRedisStore(clock)}
 	h.attach(h.store)
 	t.Cleanup(func() { h.issuer.releaseAll() })
@@ -202,7 +218,7 @@ func newFetchHarness(t *testing.T, provider TokenProvider) *fetchHarness {
 // attach (re)builds the service and Fetcher over store: a process start.
 func (h *fetchHarness) attach(store *countingStore) {
 	h.t.Helper()
-	clock := func() time.Time { return h.now }
+	clock := h.clock
 	if isApprovalProvider(h.provider) {
 		service, err := newApprovalService(store, testProviderConfig(h.provider), time.Second)
 		if err != nil {
@@ -218,7 +234,7 @@ func (h *fetchHarness) attach(store *countingStore) {
 		h.cacheKey, h.lockKey = service.CacheKey, service.LockKey
 		h.fetcher, h.ensurer = service.NewFetcher(), service
 		h.writeRedis = func(token string, expiresIn int64) {
-			payload, err := service.payload(token, expiresIn, h.now)
+			payload, err := service.payload(token, expiresIn, h.clock())
 			if err != nil {
 				h.t.Fatal(err)
 			}

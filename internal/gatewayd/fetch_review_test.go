@@ -189,7 +189,7 @@ func TestFetchOverlappingReportsShareARefreshThatReturnsTheSameToken(t *testing.
 			if !isApprovalProvider(provider) {
 				// A payload record's expiry moves with the clock; real issues are
 				// never in the same instant.
-				h.issuer.onIssue = func() { h.now = h.now.Add(time.Second) }
+				h.issuer.onIssue = func() { h.advance(time.Second) }
 			}
 			first := h.fetch("")
 			// Hold the refresh open so every report is in flight before it completes
@@ -311,7 +311,7 @@ func TestFetchFailureReportIsResolvedAgainstRedisNotStaleMemory(t *testing.T) {
 func TestFetchJudgesRemainingLifetimeAfterTheRedisRead(t *testing.T) {
 	h := newFetchHarness(t, ProviderToss)
 	h.writeRedis(externalA, 70)
-	h.store.onNextGet(func() { h.now = h.now.Add(20 * time.Second) })
+	h.store.onNextGet(func() { h.advance(20 * time.Second) })
 	got := h.fetch("")
 	if got.Token == externalA || got.Source != FetchSourceIssued {
 		t.Fatalf("served a token with 50 s left (source %s)", got.Source)
@@ -380,7 +380,7 @@ func TestApprovalSameKeyIsNotAPublicationJustBecauseTheFirstReadWasSlow(t *testi
 	h := newFetchHarness(t, ProviderKISLiveApproval)
 	first := h.fetch("")
 	// The baseline read spends 2 s before the server answers.
-	h.store.getWithTTLHook = func() { h.now = h.now.Add(2 * time.Second) }
+	h.store.getWithTTLHook = func() { h.advance(2 * time.Second) }
 	got := h.fetch(first.SHA256)
 	if got.Source != FetchSourceIssued || h.issuer.callCount() != 2 {
 		t.Fatalf("an untouched approval key was returned for its own failure report (source %s)", got.Source)
