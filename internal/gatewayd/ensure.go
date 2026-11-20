@@ -123,16 +123,36 @@ func providerTokenKeys(config ProviderConfig) (string, string, error) {
 // token, otherwise it takes the provider's cooperative distributed lock and
 // issues exactly one replacement token.
 func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
+	return service.ensure(ctx, false)
+}
+
+// EnsureForce is Ensure without trusting the cached token: it skips the two
+// freshness short-circuits and issues under the same lock. A contended lock
+// still waits for a fresh token exactly as Ensure does.
+func (service *EnsureService) EnsureForce(ctx context.Context) (EnsureState, error) {
+	return service.ensure(ctx, true)
+}
+
+func (service *EnsureService) tokenKey() string {
+	if service == nil {
+		return ""
+	}
+	return service.CacheKey
+}
+
+func (service *EnsureService) ensure(ctx context.Context, force bool) (EnsureState, error) {
 	if service == nil || !knownProvider(service.Provider) || service.Store == nil || service.OAuth == nil ||
 		service.CacheKey == "" || service.LockKey == "" || service.AppKey == "" || service.AppSecret == "" {
 		return "", errEnsureUnavailable
 	}
-	fresh, err := service.hasFreshToken(ctx)
-	if err != nil {
-		return "", err
-	}
-	if fresh {
-		return EnsureStateFresh, nil
+	if !force {
+		fresh, err := service.hasFreshToken(ctx)
+		if err != nil {
+			return "", err
+		}
+		if fresh {
+			return EnsureStateFresh, nil
+		}
 	}
 	lockValue, err := newLockValue()
 	if err != nil {
@@ -149,12 +169,14 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 
 	// A peer can populate the cache between the initial GET and SET NX. Check
 	// again while owning the lock before contacting the provider.
-	fresh, err = service.hasFreshToken(ctx)
-	if err != nil {
-		return "", err
-	}
-	if fresh {
-		return EnsureStateFresh, nil
+	if !force {
+		fresh, err := service.hasFreshToken(ctx)
+		if err != nil {
+			return "", err
+		}
+		if fresh {
+			return EnsureStateFresh, nil
+		}
 	}
 	issued, err := service.OAuth.Issue(ctx, service.AppKey, service.AppSecret)
 	if err != nil || !validIssuedToken(issued, providerTokenExpiryBuffer(service.Provider)) {

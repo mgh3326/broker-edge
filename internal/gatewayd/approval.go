@@ -44,6 +44,8 @@ func newApprovalService(store approvalStore, config ProviderConfig, timeout time
 	return &approvalService{store: store, config: config, issuer: approvalIssuer{config: config, timeout: timeout}, cacheKey: prefix, lockKey: prefix + ":lock"}, nil
 }
 
+func (s *approvalService) tokenKey() string { return s.cacheKey }
+
 func (s *approvalService) cachedTTL(ctx context.Context) (time.Duration, error) {
 	ttl, err := s.store.TTL(ctx, s.cacheKey)
 	if err != nil {
