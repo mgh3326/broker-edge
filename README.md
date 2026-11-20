@@ -171,6 +171,12 @@ the sibling key `<approval key>:gatewayd:publication`, bound to that record's
 expiry, so a report can tell a later publication of identical bytes from the one
 it observed. Legacy readers ignore the marker key.
 
+**Issuance lease.** The approval lock keeps its 15 s TTL while waiting. Right
+before gatewayd calls KIS it extends that lock to 30 s, only while it still owns
+it (no extension, no broker call), so the broker's own 10 s HTTP timeout, the
+Redis phases, the publish and its read-back all fit one lease; a holder that dies
+mid-issuance therefore blocks the lock for at most 30 s.
+
 **Restart.** Nothing is lost on restart: when consumers are configured, the
 daemon loads each provider's current Redis token into memory at startup
 (read-only, never issuing), and a miss later does the same read. A restart
