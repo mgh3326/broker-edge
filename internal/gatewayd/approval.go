@@ -13,6 +13,12 @@ import (
 const approvalTTL = 23 * time.Hour
 const approvalLockTTL = 15 * time.Second
 
+// approvalWaitTimeout is how long an /ensure waiter waits on a held lock. It must
+// outlive issueLease: an issuer extends the lock to issueLease just before it calls
+// KIS, so a holder that dies then keeps the lock that long. (A variable only so a
+// test can shorten it.)
+var approvalWaitTimeout = issueLease + 5*time.Second
+
 func isApprovalProvider(p TokenProvider) bool {
 	return p == ProviderKISLiveApproval || p == ProviderKISMockApproval
 }
@@ -86,9 +92,9 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 	// only decays never moves upward.
 	prevTTL := ttl0
 	if !acquired {
-		// The wait outlives approvalLockTTL so a lock whose holder died before
-		// releasing it expires before the waiter gives up.
-		deadline := time.NewTimer(approvalLockTTL + 5*time.Second)
+		// The wait outlives the extended issuance lease so a lock whose holder died
+		// before releasing it expires before the waiter gives up.
+		deadline := time.NewTimer(approvalWaitTimeout)
 		defer deadline.Stop()
 		ticker := time.NewTicker(250 * time.Millisecond)
 		defer ticker.Stop()
@@ -122,14 +128,15 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 			case <-ctx.Done():
 				return "", errEnsureUnavailable
 			case <-deadline.C:
-				// A fresh record at the deadline means a refresh completed
-				// with a lingering lock; the published key is valid, so the
-				// wait succeeded.
+				// A fresh record at the deadline means a refresh completed with a
+				// lingering lock, so the wait succeeded; a forced refresh also needs
+				// the same publication evidence as in the loop (the TTL moved up),
+				// never just "the old key still has time left".
 				ttl, err := s.cachedTTL(ctx)
 				if err != nil {
 					return "", err
 				}
-				if ttl > tokenExpiryBuffer {
+				if ttl > tokenExpiryBuffer && (!force || ttl > prevTTL) {
 					return EnsureStateFresh, nil
 				}
 				return "", errLockWaitTimeout

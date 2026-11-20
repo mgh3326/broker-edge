@@ -265,3 +265,42 @@ func TestApprovalForceKeepsOldValueDuringIssue(t *testing.T) {
 		t.Fatal("replacement missing")
 	}
 }
+
+// A forced refresh that times out waiting on a lock must not be acknowledged just
+// because the old key still has time left: nothing was published.
+func TestApprovalForceWaiterDoesNotAcknowledgeAnUnrefreshedKeyAtTheDeadline(t *testing.T) {
+	previous := approvalWaitTimeout
+	approvalWaitTimeout = 300 * time.Millisecond
+	defer func() { approvalWaitTimeout = previous }()
+	for _, p := range []TokenProvider{ProviderKISLiveApproval, ProviderKISMockApproval} {
+		t.Run(string(p), func(t *testing.T) {
+			ctx := context.Background()
+			now := testGatewayNow()
+			store := newFakeRedisStore(func() time.Time { return now })
+			s, err := newApprovalService(store, testProviderConfig(p), time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.issuer = &fakeOAuthIssuer{token: OAuthToken{AccessToken: "approval-value"}}
+			store.save(s.cacheKey, "the-rejected-key", approvalTTL)
+			// A holder extended the lock to the issuance lease and then died.
+			if _, err := store.SetNX(ctx, s.lockKey, "extended-holder", issueLease); err != nil {
+				t.Fatal(err)
+			}
+			if state, err := s.EnsureForce(ctx); err == nil {
+				t.Fatalf("force on an unrefreshed key returned %q", state)
+			}
+			if state, err := s.Ensure(ctx); err != nil || state != EnsureStateFresh {
+				t.Fatalf("a plain ensure on a fresh key = %s %v", state, err)
+			}
+		})
+	}
+}
+
+// The waiter outlives the extended lease, so a holder that dies after extending
+// has released (expired) the lock before any waiter gives up.
+func TestApprovalWaiterOutlivesTheExtendedIssuanceLease(t *testing.T) {
+	if approvalWaitTimeout <= issueLease {
+		t.Fatalf("waiter gives up after %v, before the extended lease (%v) can expire", approvalWaitTimeout, issueLease)
+	}
+}
