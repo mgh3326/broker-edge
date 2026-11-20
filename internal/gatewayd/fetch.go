@@ -398,6 +398,8 @@ func (f *Fetcher) resolveShared(ctx context.Context, failedSHA256 string, entryS
 		if readErr != nil {
 			return FetchedToken{}, false, nil, errFetchUnavailable
 		}
+		// Judge remaining lifetime at the end of the read, not before it.
+		now = f.now()
 		observed = nil
 		if present {
 			copied := stored

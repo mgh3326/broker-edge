@@ -295,3 +295,15 @@ func TestFetchFailureReportIsResolvedAgainstRedisNotStaleMemory(t *testing.T) {
 		}
 	})
 }
+
+// Freshness is judged after the Redis read finishes: a token with 70 s left that
+// spends 20 s in the read has 50 s left and must not be served as "more than 60".
+func TestFetchJudgesRemainingLifetimeAfterTheRedisRead(t *testing.T) {
+	h := newFetchHarness(t, ProviderToss)
+	h.writeRedis(externalA, 70)
+	h.store.onNextGet(func() { h.now = h.now.Add(20 * time.Second) })
+	got := h.fetch("")
+	if got.Token == externalA || got.Source != FetchSourceIssued {
+		t.Fatalf("served a token with 50 s left (source %s)", got.Source)
+	}
+}
