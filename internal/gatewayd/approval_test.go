@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -297,10 +299,61 @@ func TestApprovalForceWaiterDoesNotAcknowledgeAnUnrefreshedKeyAtTheDeadline(t *t
 	}
 }
 
-// The waiter outlives the extended lease, so a holder that dies after extending
-// has released (expired) the lock before any waiter gives up.
-func TestApprovalWaiterOutlivesTheExtendedIssuanceLease(t *testing.T) {
-	if approvalWaitTimeout <= issueLease {
-		t.Fatalf("waiter gives up after %v, before the extended lease (%v) can expire", approvalWaitTimeout, issueLease)
+// The cap must cover a holder that extends the lock as late as it may (just
+// before its initial lease deadline) and then dies: the lock then outlives the
+// waiter's own start by the rest of the initial lease plus the full extended
+// lease, so a shorter cap would return 503 before the lock can expire.
+func TestApprovalWaiterCapCoversALateExtensionByAHolderThatThenDies(t *testing.T) {
+	latestExpiryAfterAcquisition := (approvalLockTTL - fetchLeaseMargin) + issueLease
+	if approvalWaitTimeout <= latestExpiryAfterAcquisition {
+		t.Fatalf("waiter gives up %v after it starts, but a lock extended at the last moment lives %v after acquisition", approvalWaitTimeout, latestExpiryAfterAcquisition)
+	}
+}
+
+// A waiter that started before the extension takes over once the extended lock
+// expires, with no timer involved.
+func TestApprovalWaiterThatStartedBeforeTheExtensionTakesOverWhenTheExtendedLockExpires(t *testing.T) {
+	ctx := context.Background()
+	var clock atomic.Int64
+	clock.Store(testGatewayNow().UnixNano())
+	now := func() time.Time { return time.Unix(0, clock.Load()) }
+	store := newFakeRedisStore(now)
+	s, err := newApprovalService(store, testProviderConfig(ProviderKISLiveApproval), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.now = now
+	issuer := &fakeOAuthIssuer{token: OAuthToken{AccessToken: "replacement-approval-key"}}
+	s.issuer = issuer
+	store.save(s.cacheKey, "the-rejected-key", approvalTTL)
+	// The holder took the 15 s lock before the waiter started...
+	if _, err := store.SetNX(ctx, s.lockKey, "holder", approvalLockTTL); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		state, err := s.EnsureForce(ctx)
+		if err == nil && state != EnsureStateIssued {
+			err = errors.New("state " + string(state))
+		}
+		result <- err
+	}()
+	time.Sleep(300 * time.Millisecond) // the waiter is polling a held lock
+	// ...and extended it to the issuance lease only afterwards, then died.
+	if err := store.ExtendLockIfHeld(ctx, s.lockKey, "holder", issueLease); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if issuer.callCount() != 0 {
+		t.Fatal("issued while the extended lock was still held")
+	}
+	clock.Store(clock.Load() + int64(issueLease+time.Second))
+	select {
+	case err := <-result:
+		if err != nil || issuer.callCount() != 1 {
+			t.Fatalf("takeover: %v, issuer calls %d", err, issuer.callCount())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the waiter never took over the expired lock")
 	}
 }

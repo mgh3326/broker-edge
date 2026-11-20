@@ -13,11 +13,14 @@ import (
 const approvalTTL = 23 * time.Hour
 const approvalLockTTL = 15 * time.Second
 
-// approvalWaitTimeout is how long an /ensure waiter waits on a held lock. It must
-// outlive issueLease: an issuer extends the lock to issueLease just before it calls
-// KIS, so a holder that dies then keeps the lock that long. (A variable only so a
-// test can shorten it.)
-var approvalWaitTimeout = issueLease + 5*time.Second
+// approvalWaitTimeout is the hard cap on an /ensure waiter's wait for a held lock.
+// The waiter takes over as soon as the lock is gone, so this only bounds a lock
+// that stays. An issuer extends the lock to issueLease at most once, no later
+// than its initial lease deadline (approvalLockTTL minus the lease margin, after
+// acquisition), so the lock can outlive its acquisition by at most that plus
+// issueLease; the waiter starts after the acquisition. The cap covers the whole
+// span with polling margin. (A variable only so a test can shorten it.)
+var approvalWaitTimeout = approvalLockTTL - fetchLeaseMargin + issueLease + 5*time.Second
 
 func isApprovalProvider(p TokenProvider) bool {
 	return p == ProviderKISLiveApproval || p == ProviderKISMockApproval
@@ -92,8 +95,10 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 	// only decays never moves upward.
 	prevTTL := ttl0
 	if !acquired {
-		// The wait outlives the extended issuance lease so a lock whose holder died
-		// before releasing it expires before the waiter gives up.
+		// The wait outlives the latest possible extended lease (see
+		// approvalWaitTimeout), so a lock whose holder died before releasing it
+		// expires before the waiter gives up, wherever in the holder's issuance
+		// the extension happened.
 		deadline := time.NewTimer(approvalWaitTimeout)
 		defer deadline.Stop()
 		ticker := time.NewTicker(250 * time.Millisecond)
