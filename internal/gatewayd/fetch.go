@@ -43,7 +43,7 @@ type TokenReadStore interface {
 // /ensure route calls, its force variant, and the Redis key it publishes to.
 type fetchSource interface {
 	Ensurer
-	EnsureForce(ctx context.Context) (EnsureState, error)
+	EnsureReplacing(ctx context.Context, rejectedSHA string) (EnsureState, error)
 	tokenKey() string
 }
 
@@ -174,8 +174,7 @@ func (service *FetchService) snapshot(ctx context.Context, provider TokenProvide
 	if !expiresAt.After(now) {
 		return nil, nil
 	}
-	sum := sha256.Sum256([]byte(token))
-	return &fetchEntry{token: token, sha256: hex.EncodeToString(sum[:]), expiresAt: expiresAt}, nil
+	return &fetchEntry{token: token, sha256: tokenSHA256(token), expiresAt: expiresAt}, nil
 }
 
 // parseCachedToken extracts the token from the provider's Redis value. JSON
@@ -212,6 +211,11 @@ func parseCachedToken(provider TokenProvider, raw string) (string, time.Time, bo
 	}
 	seconds := int64(expiresAt)
 	return token, time.Unix(seconds, int64((expiresAt-float64(seconds))*float64(time.Second))), true
+}
+
+func tokenSHA256(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 func (entry *fetchEntry) result(provider TokenProvider, source string) FetchResult {
@@ -269,7 +273,7 @@ func (service *FetchService) fetch(ctx context.Context, provider TokenProvider, 
 	var ensured EnsureState
 	var err error
 	if force {
-		ensured, err = state.source.EnsureForce(ctx)
+		ensured, err = state.source.EnsureReplacing(ctx, failedSHA)
 	} else {
 		ensured, err = state.source.Ensure(ctx)
 	}

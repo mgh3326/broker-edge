@@ -608,7 +608,7 @@ func (source panickingFetchSource) Ensure(context.Context) (EnsureState, error) 
 	panic(source.message)
 }
 
-func (source panickingFetchSource) EnsureForce(context.Context) (EnsureState, error) {
+func (source panickingFetchSource) EnsureReplacing(context.Context, string) (EnsureState, error) {
 	panic(source.message)
 }
 func (source panickingFetchSource) tokenKey() string { return "panic-key" }
@@ -686,7 +686,7 @@ func TestEnsureRouteIsUnchangedByFetch(t *testing.T) {
 	}
 }
 
-func TestEnsureForceSkipsFreshnessButKeepsTheLock(t *testing.T) {
+func TestEnsureReplacingSkipsFreshnessButKeepsTheLock(t *testing.T) {
 	h := newFetchHarness(t, ProviderKISMock)
 	service := h.ensurer.(*EnsureService)
 	h.seed("fresh-token")
@@ -694,7 +694,7 @@ func TestEnsureForceSkipsFreshnessButKeepsTheLock(t *testing.T) {
 	if state, err := service.Ensure(context.Background()); err != nil || state != EnsureStateFresh || h.issuer.callCount() != 0 {
 		t.Fatalf("Ensure = %v %v calls %d", state, err, h.issuer.callCount())
 	}
-	if state, err := service.EnsureForce(context.Background()); err != nil || state != EnsureStateIssued || h.issuer.callCount() != 1 {
+	if state, err := service.EnsureReplacing(context.Background(), ""); err != nil || state != EnsureStateIssued || h.issuer.callCount() != 1 {
 		t.Fatalf("EnsureForce = %v %v calls %d", state, err, h.issuer.callCount())
 	}
 	if locked := h.store.savedWhileLocked(); len(locked) != 1 || !locked[0] {
@@ -811,4 +811,23 @@ func TestRedisClientReadWithTTLIsOneScriptedRead(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A peer can complete a full issue cycle between the snapshot that decided to
+// force and the lock acquisition. The forced path must then adopt the peer's
+// token instead of issuing a second one (which, for Toss, kills the first).
+func TestFetchForcedReissueYieldsToAPeerThatPublishedBeforeTheLock(t *testing.T) {
+	eachFetchProvider(t, func(t *testing.T, h *fetchHarness) {
+		h.seed("rejected-token")
+		wantToken(t, h.fetchBody(`{}`), "rejected-token", "redis")
+		h.issue("must-not-be-issued")
+		var once sync.Once
+		h.store.setNXHook = func() { once.Do(func() { h.seed("peer-token") }) }
+		reply := h.fetchBody(`{"failed_token_sha256":"` + shaHex("rejected-token") + `"}`)
+		wantToken(t, reply, "peer-token", "redis")
+		if h.issuer.callCount() != 0 {
+			t.Fatalf("issuer calls = %d, want 0: the forced path replaced a token a peer had just published", h.issuer.callCount())
+		}
+		wantToken(t, h.fetchBody(`{}`), "peer-token", "memory")
+	})
 }

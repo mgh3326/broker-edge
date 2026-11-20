@@ -123,14 +123,33 @@ func providerTokenKeys(config ProviderConfig) (string, string, error) {
 // token, otherwise it takes the provider's cooperative distributed lock and
 // issues exactly one replacement token.
 func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
-	return service.ensure(ctx, false)
+	return service.ensure(ctx, false, "")
 }
 
-// EnsureForce is Ensure without trusting the cached token: it skips the two
-// freshness short-circuits and issues under the same lock. A contended lock
-// still waits for a fresh token exactly as Ensure does.
-func (service *EnsureService) EnsureForce(ctx context.Context) (EnsureState, error) {
-	return service.ensure(ctx, true)
+// EnsureReplacing replaces the token whose hash a consumer reported as
+// rejected. It skips the pre-lock freshness short-circuit, but under the lock it
+// re-reads the cache and issues nothing if a different usable token was
+// published since the caller decided to replace (a peer already did the work).
+// A contended lock still waits for a fresh token exactly as Ensure does.
+func (service *EnsureService) EnsureReplacing(ctx context.Context, rejectedSHA string) (EnsureState, error) {
+	return service.ensure(ctx, true, rejectedSHA)
+}
+
+// replacedSince reports whether the cache now holds a usable token whose hash
+// differs from the rejected one.
+func (service *EnsureService) replacedSince(ctx context.Context, rejectedSHA string) (bool, error) {
+	raw, present, err := service.Store.Get(ctx, service.CacheKey)
+	if err != nil {
+		return false, errEnsureUnavailable
+	}
+	if !present {
+		return false, nil
+	}
+	token, _, ok := parseCachedToken(service.Provider, raw)
+	if !ok || tokenSHA256(token) == rejectedSHA {
+		return false, nil
+	}
+	return service.hasFreshToken(ctx)
 }
 
 func (service *EnsureService) tokenKey() string {
@@ -140,7 +159,7 @@ func (service *EnsureService) tokenKey() string {
 	return service.CacheKey
 }
 
-func (service *EnsureService) ensure(ctx context.Context, force bool) (EnsureState, error) {
+func (service *EnsureService) ensure(ctx context.Context, force bool, rejectedSHA string) (EnsureState, error) {
 	if service == nil || !knownProvider(service.Provider) || service.Store == nil || service.OAuth == nil ||
 		service.CacheKey == "" || service.LockKey == "" || service.AppKey == "" || service.AppSecret == "" {
 		return "", errEnsureUnavailable
@@ -175,6 +194,14 @@ func (service *EnsureService) ensure(ctx context.Context, force bool) (EnsureSta
 			return "", err
 		}
 		if fresh {
+			return EnsureStateFresh, nil
+		}
+	} else if rejectedSHA != "" {
+		replaced, err := service.replacedSince(ctx, rejectedSHA)
+		if err != nil {
+			return "", err
+		}
+		if replaced {
 			return EnsureStateFresh, nil
 		}
 	}
