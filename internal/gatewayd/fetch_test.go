@@ -29,6 +29,8 @@ type countingStore struct {
 	// getDelay slows every GET.
 	failGetOn atomic.Int64
 	getDelay  time.Duration
+	// setNXDelay slows SET NX.
+	setNXDelay time.Duration
 }
 
 func (store *countingStore) Get(ctx context.Context, key string) (string, bool, error) {
@@ -57,8 +59,18 @@ func (store *countingStore) TTL(ctx context.Context, key string) (time.Duration,
 	return store.fakeRedisStore.TTL(ctx, key)
 }
 
+func (store *countingStore) SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	if store.setNXDelay > 0 {
+		time.Sleep(store.setNXDelay)
+	}
+	return store.fakeRedisStore.SetNX(ctx, key, value, ttl)
+}
+
 func (store *countingStore) GetWithTTL(ctx context.Context, key string) (string, time.Duration, int64, string, bool, error) {
 	store.reads.Add(1)
+	if store.getDelay > 0 {
+		time.Sleep(store.getDelay)
+	}
 	store.hookMu.Lock()
 	hook := store.getWithTTLHook
 	store.getWithTTLHook = nil
@@ -106,6 +118,8 @@ type seqIssuer struct {
 	gateOnce sync.Once
 	// deadline is the deadline of the context the last Issue call received.
 	deadline time.Time
+	// enteredAt is when the last Issue call began.
+	enteredAt time.Time
 }
 
 func (issuer *seqIssuer) Issue(ctx context.Context, _, _ string) (OAuthToken, error) {
@@ -114,6 +128,7 @@ func (issuer *seqIssuer) Issue(ctx context.Context, _, _ string) (OAuthToken, er
 	n := issuer.calls
 	started, release, err, tokenFn, onIssue := issuer.started, issuer.release, issuer.err, issuer.tokenFn, issuer.onIssue
 	issuer.deadline, _ = ctx.Deadline()
+	issuer.enteredAt = time.Now()
 	issuer.mu.Unlock()
 	if started != nil {
 		select {

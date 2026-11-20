@@ -115,9 +115,11 @@ func TestFetchIssuancePhaseIsBoundedByTheLockLease(t *testing.T) {
 		t.Run(string(provider), func(t *testing.T) {
 			h := newFetchHarness(t, provider)
 			h.fetch("")
+			// The 15 s approval lock is extended (owner-checked) to issueLease before
+			// the broker is called; every other lease is already long enough.
 			lease := lockTTL
 			if isApprovalProvider(provider) {
-				lease = approvalLockTTL
+				lease = issueLease
 			}
 			h.issuer.mu.Lock()
 			deadline := h.issuer.deadline

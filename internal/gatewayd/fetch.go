@@ -236,17 +236,24 @@ var (
 	minIssueWindow   = 4 * time.Second
 )
 
+// issueLease is the lock lease an issuance runs under. A lock with a shorter TTL
+// (the 15 s approval lock) is extended to this, owner-checked, right before the
+// broker is called: 15 s cannot hold three Redis phases, the broker's own 10 s
+// HTTP timeout, a publish and a read-back. The cost is that a holder that dies
+// mid-issuance keeps the lock for at most issueLease.
+const issueLease = 30 * time.Second
+
 // leaseReserves is the part of the lease kept back for publishing and for
-// reconciling a publish: the configured maxima, at most 1/15 of the lease each
-// (a 15 s approval lease keeps 1 s each, leaving the broker its full 10 s HTTP
-// timeout; a 30 s Toss lease keeps 2 s each). lease == 0 means "use the maxima".
+// reconciling a publish: the configured maxima, at most 1/10 of the lease each
+// (a 30 s lease keeps 3 s each, enough for one Redis dial). lease == 0 means
+// "use the maxima".
 func leaseReserves(lease time.Duration) (publish, reconcile time.Duration) {
 	publish, reconcile = publishReserve, reconcileReserve
 	if lease > 0 {
-		if scaled := lease / 15; scaled < publish {
+		if scaled := lease / 10; scaled < publish {
 			publish = scaled
 		}
-		if scaled := lease / 15; scaled < reconcile {
+		if scaled := lease / 10; scaled < reconcile {
 			reconcile = scaled
 		}
 	}
@@ -279,6 +286,9 @@ type issuancePlan struct {
 	// called; withdraw is lock- and record-conditional.
 	singleToken bool
 	withdraw    func(ctx context.Context, expectedRaw string) error
+	// extend, if set, resets the lock's TTL to the given lease while the caller
+	// still owns it; it is used when lease is shorter than issueLease.
+	extend func(ctx context.Context, lease time.Duration) error
 }
 
 // issueAndPublish is the single issuance path shared by /ensure and /fetch.
@@ -300,18 +310,39 @@ type issuancePlan struct {
 //   - A publish whose reply was lost is confirmed by reading the record back;
 //     a committed replacement is never removed or reissued.
 func issueAndPublish(ctx context.Context, plan issuancePlan) (FetchedToken, error) {
+	extending := plan.extend != nil && plan.lease < issueLease
 	publishTail, reconcileTail := leaseReserves(plan.lease)
 	need := minIssueWindow + publishTail + reconcileTail
+	if extending {
+		need = 2 * time.Second // snapshot and extension; the broker budget comes after
+	}
 	if ctx.Err() != nil || time.Until(plan.lock.deadline) < need {
 		return FetchedToken{}, errIssueFailed
 	}
-	work, cancel := context.WithDeadline(context.WithoutCancel(ctx), plan.lock.deadline)
-	defer cancel()
+	snapshotCtx, cancelSnapshot := context.WithDeadline(context.WithoutCancel(ctx), plan.lock.deadline)
+	defer cancelSnapshot()
 
-	stored, present, err := plan.readRedis(work, plan.now())
+	stored, present, err := plan.readRedis(snapshotCtx, plan.now())
 	if err != nil || time.Until(plan.lock.deadline) < need {
 		return FetchedToken{}, errIssueFailed
 	}
+	deadline := plan.lock.deadline
+	if extending {
+		// Verify ownership and take a lease that fits the whole destructive phase,
+		// measured from before the extension command. Uncertain ownership means no
+		// broker call.
+		extensionStart := time.Now()
+		if err := plan.extend(snapshotCtx, issueLease); err != nil {
+			return FetchedToken{}, errIssueFailed
+		}
+		deadline = leaseDeadline(extensionStart, issueLease)
+		publishTail, reconcileTail = leaseReserves(issueLease)
+		if time.Until(deadline) < minIssueWindow+publishTail+reconcileTail {
+			return FetchedToken{}, errIssueFailed
+		}
+	}
+	work, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	defer cancel()
 	if plan.singleToken {
 		if present {
 			if err := plan.withdraw(work, stored.Raw); err != nil {
@@ -327,13 +358,13 @@ func issueAndPublish(ctx context.Context, plan issuancePlan) (FetchedToken, erro
 		}
 		plan.memory.revoke(replaced...)
 	}
-	brokerCtx, cancelBroker := context.WithDeadline(work, plan.lock.deadline.Add(-publishTail-reconcileTail))
+	brokerCtx, cancelBroker := context.WithDeadline(work, deadline.Add(-publishTail-reconcileTail))
 	issued, err := plan.issue(brokerCtx)
 	cancelBroker()
 	if err != nil {
 		return FetchedToken{}, errIssueFailed
 	}
-	publishCtx, cancelPublish := context.WithDeadline(work, plan.lock.deadline.Add(-reconcileTail))
+	publishCtx, cancelPublish := context.WithDeadline(work, deadline.Add(-reconcileTail))
 	defer cancelPublish()
 	committed := false
 	for attempt := range publishAttempts {

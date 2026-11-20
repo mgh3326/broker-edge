@@ -52,6 +52,8 @@ type RedisStore interface {
 	// reader tell this publication from a later one with identical bytes. It
 	// returns errLockLost when the lock is not held.
 	SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration, publication string) error
+	// ExtendLockIfHeld resets lockKey's TTL to ttl only while it holds lockValue.
+	ExtendLockIfHeld(ctx context.Context, lockKey, lockValue string, ttl time.Duration) error
 	// WithdrawIfLockHeld deletes key only while lockKey holds lockValue and key
 	// still holds expected. errLockLost / errStateChanged report which check failed.
 	WithdrawIfLockHeld(ctx context.Context, lockKey, lockValue, key, expected string) error
@@ -204,6 +206,26 @@ func (client *RedisClient) SetIfLockHeld(ctx context.Context, lockKey, lockValue
 		return errLockLost
 	}
 	if reply.kind != '+' || reply.text != "OK" {
+		return errRedisUnavailable
+	}
+	return nil
+}
+
+// ExtendLockIfHeld is EXPIRE guarded by lock ownership in one Lua call.
+func (client *RedisClient) ExtendLockIfHeld(ctx context.Context, lockKey, lockValue string, ttl time.Duration) error {
+	seconds, valid := redisTTLSeconds(ttl)
+	if !valid {
+		return errRedisUnavailable
+	}
+	const script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('EXPIRE', KEYS[1], ARGV[2]) else return false end"
+	reply, err := client.execute(ctx, "EVAL", script, "1", lockKey, lockValue, seconds)
+	if err != nil {
+		return errRedisUnavailable
+	}
+	if reply.nilValue || (reply.kind == ':' && reply.text == "0") {
+		return errLockLost
+	}
+	if reply.kind != ':' {
 		return errRedisUnavailable
 	}
 	return nil

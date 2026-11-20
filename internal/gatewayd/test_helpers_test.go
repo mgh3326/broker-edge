@@ -34,6 +34,9 @@ type fakeRedisStore struct {
 	delErr   error
 	deletes  []string
 	markers  map[string]string
+	// extendErr fails ExtendLockIfHeld; extensions records the TTLs granted.
+	extendErr  error
+	extensions []time.Duration
 	// lostReply makes the next SetIfLockHeld commit and then report a transport
 	// error, as when the connection drops before the reply arrives.
 	lostReply bool
@@ -327,5 +330,20 @@ func (store *fakeRedisStore) WithdrawIfLockHeld(_ context.Context, lockKey, lock
 	delete(store.values, key)
 	delete(store.markers, key)
 	store.deletes = append(store.deletes, key)
+	return nil
+}
+
+func (store *fakeRedisStore) ExtendLockIfHeld(_ context.Context, lockKey, lockValue string, ttl time.Duration) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.extendErr != nil {
+		return store.extendErr
+	}
+	lock, found := store.locks[lockKey]
+	if !found || lock.value != lockValue || (!lock.expiresAt.IsZero() && !store.now().Before(lock.expiresAt)) {
+		return errLockLost
+	}
+	store.locks[lockKey] = storedValue{value: lock.value, expiresAt: store.now().Add(ttl)}
+	store.extensions = append(store.extensions, ttl)
 	return nil
 }

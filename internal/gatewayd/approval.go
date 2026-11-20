@@ -167,6 +167,9 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 func (s *approvalService) issueAndStore(ctx context.Context, lock issuanceLock) (FetchedToken, error) {
 	return issueAndPublish(ctx, issuancePlan{
 		memory: s.memory, lock: lock, lease: approvalLockTTL, now: s.now, readRedis: s.readRedis,
+		extend: func(c context.Context, lease time.Duration) error {
+			return s.store.ExtendLockIfHeld(c, lock.key, lock.value, lease)
+		},
 		issue: func(work context.Context) (issuedToken, error) {
 			issued, err := s.issuer.Issue(work, s.config.AppKey, s.config.AppSecret)
 			if err != nil || strings.TrimSpace(issued.AccessToken) == "" {

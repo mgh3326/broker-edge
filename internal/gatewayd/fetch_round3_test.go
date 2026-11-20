@@ -313,3 +313,80 @@ func TestTossFailureReportOnARedisMissDoesNotReturnTheMemoryToken(t *testing.T) 
 		}
 	})
 }
+
+// The broker gets its full HTTP timeout measured from the moment it is called,
+// not from before the Redis phases (SET NX, recheck, snapshot) that precede it.
+func TestBrokerDeadlineIsMeasuredAtIssueEntryUnderSlowRedis(t *testing.T) {
+	const brokerHTTPTimeout = 10 * time.Second
+	for _, provider := range []TokenProvider{ProviderKISLiveApproval, ProviderToss} {
+		t.Run(string(provider), func(t *testing.T) {
+			h := newFetchHarness(t, provider)
+			first := h.fetch("")
+			h.store.getDelay, h.store.setNXDelay = 400*time.Millisecond, 400*time.Millisecond
+			h.fetch(first.SHA256) // baseline read, SET NX, recheck read, snapshot read: ~400 ms each
+			h.issuer.mu.Lock()
+			room := h.issuer.deadline.Sub(h.issuer.enteredAt)
+			h.issuer.mu.Unlock()
+			if room < brokerHTTPTimeout {
+				t.Fatalf("the broker had %v at entry, less than its %v timeout", room, brokerHTTPTimeout)
+			}
+			if isApprovalProvider(provider) {
+				if len(h.store.extensions) != 2 || h.store.extensions[1] != issueLease {
+					t.Fatalf("approval lock extensions = %v", h.store.extensions)
+				}
+			} else if len(h.store.extensions) != 0 {
+				t.Fatalf("%s lock was extended: %v", provider, h.store.extensions)
+			}
+		})
+	}
+}
+
+// Uncertain ownership of the lock means no broker call.
+func TestApprovalIssuanceDoesNotCallTheBrokerWhenTheLockCannotBeExtended(t *testing.T) {
+	h := newFetchHarness(t, ProviderKISLiveApproval)
+	h.store.extendErr = errors.New("redis unavailable")
+	if _, err := h.fetcher.Fetch(context.Background(), ""); err == nil || h.issuer.callCount() != 0 {
+		t.Fatalf("err %v, issuer calls %d", err, h.issuer.callCount())
+	}
+}
+
+// After the lease is extended, a read-back of a publish whose reply stalled until
+// its deadline still gets a full Redis dial's worth of time.
+func TestReadBackAfterAStalledPublishKeepsAFullRedisDialOnAnExtendedLease(t *testing.T) {
+	var publishDeadline, readBackDeadline time.Time
+	reads := 0
+	token := newFetchedToken("EXTENDED-LEASE-TOKEN-0123456789", time.Unix(2_000_003_600, 0))
+	plan := issuancePlan{
+		memory: newTokenMemory(),
+		lock:   issuanceLock{key: "lock", value: "owner", deadline: time.Now().Add(13 * time.Second)},
+		lease:  approvalLockTTL,
+		now:    testGatewayNow,
+		extend: func(context.Context, time.Duration) error { return nil },
+		readRedis: func(ctx context.Context, _ time.Time) (FetchedToken, bool, error) {
+			reads++
+			if reads == 1 {
+				return FetchedToken{}, false, nil
+			}
+			readBackDeadline, _ = ctx.Deadline()
+			stored := token
+			stored.Raw = "committed"
+			return stored, true, nil
+		},
+		issue: func(context.Context) (issuedToken, error) {
+			return issuedToken{
+				token: token,
+				publish: func(ctx context.Context) error {
+					publishDeadline, _ = ctx.Deadline()
+					return errors.New("reply lost")
+				},
+				committed: func(stored FetchedToken) bool { return stored.Raw == "committed" },
+			}, nil
+		},
+	}
+	if _, err := issueAndPublish(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	if room := readBackDeadline.Sub(publishDeadline); room < redisDialTimeout {
+		t.Fatalf("the read-back window after the publish deadline is %v, shorter than one Redis dial (%v)", room, redisDialTimeout)
+	}
+}
