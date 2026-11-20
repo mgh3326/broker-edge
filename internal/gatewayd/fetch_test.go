@@ -15,16 +15,44 @@ import (
 type countingStore struct {
 	*fakeRedisStore
 	reads atomic.Int64
+	// separateReads counts GET and PTTL, which the approval fetch path must not
+	// use (it reads value and TTL atomically).
+	separateReads atomic.Int64
+	// getHook runs once, after the next GET has read its value and before it
+	// returns: it models another actor publishing during a read.
+	hookMu  sync.Mutex
+	getHook func()
 }
 
 func (store *countingStore) Get(ctx context.Context, key string) (string, bool, error) {
 	store.reads.Add(1)
-	return store.fakeRedisStore.Get(ctx, key)
+	store.separateReads.Add(1)
+	value, present, err := store.fakeRedisStore.Get(ctx, key)
+	store.hookMu.Lock()
+	hook := store.getHook
+	store.getHook = nil
+	store.hookMu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return value, present, err
 }
 
 func (store *countingStore) TTL(ctx context.Context, key string) (time.Duration, error) {
 	store.reads.Add(1)
+	store.separateReads.Add(1)
 	return store.fakeRedisStore.TTL(ctx, key)
+}
+
+func (store *countingStore) GetWithTTL(ctx context.Context, key string) (string, time.Duration, bool, error) {
+	store.reads.Add(1)
+	return store.fakeRedisStore.GetWithTTL(ctx, key)
+}
+
+func (store *countingStore) onNextGet(hook func()) {
+	store.hookMu.Lock()
+	store.getHook = hook
+	store.hookMu.Unlock()
 }
 
 // seqIssuer hands out a distinct token per call, so a reissue is observable.
@@ -35,6 +63,8 @@ type seqIssuer struct {
 	release chan struct{}
 	err     error
 	tokenFn func(n int) string
+	// deadline is the deadline of the context the last Issue call received.
+	deadline time.Time
 }
 
 func (issuer *seqIssuer) Issue(ctx context.Context, _, _ string) (OAuthToken, error) {
@@ -42,6 +72,7 @@ func (issuer *seqIssuer) Issue(ctx context.Context, _, _ string) (OAuthToken, er
 	issuer.calls++
 	n := issuer.calls
 	started, release, err, tokenFn := issuer.started, issuer.release, issuer.err, issuer.tokenFn
+	issuer.deadline, _ = ctx.Deadline()
 	issuer.mu.Unlock()
 	if started != nil {
 		select {
@@ -86,6 +117,7 @@ type fetchHarness struct {
 	// cacheKey/lockKey are the provider's existing Redis keys.
 	cacheKey, lockKey string
 	provider          TokenProvider
+	ensurer           Ensurer
 	// writeRedis puts another issuer's token into Redis the way its Python
 	// writer would.
 	writeRedis func(token string, expiresIn int64)
@@ -111,13 +143,13 @@ func (h *fetchHarness) attach(store *countingStore) {
 		}
 		service.issuer, service.now = h.issuer, clock
 		h.cacheKey, h.lockKey = service.cacheKey, service.lockKey
-		h.fetcher = service.newFetcher()
+		h.fetcher, h.ensurer = service.newFetcher(), service
 		h.writeRedis = func(token string, _ int64) { store.save(service.cacheKey, token, approvalTTL) }
 	} else {
 		service := newTestEnsureServiceForProvider(h.t, store, h.issuer, h.now, h.provider)
 		service.Now = clock
 		h.cacheKey, h.lockKey = service.CacheKey, service.LockKey
-		h.fetcher = service.NewFetcher()
+		h.fetcher, h.ensurer = service.NewFetcher(), service
 		h.writeRedis = func(token string, expiresIn int64) {
 			payload, err := service.payload(token, expiresIn, h.now)
 			if err != nil {
@@ -281,7 +313,8 @@ func TestFetchFailedHashDifferentReturnsCurrentWithoutIssuing(t *testing.T) {
 			first := h.fetch("")
 			stale := sha("a-token-this-caller-held-before-a-reissue")
 			got := h.fetch(stale)
-			if got.Source != FetchSourceMemory || got.Token != first.Token || h.issuer.callCount() != 1 {
+			// The report is resolved against Redis, which still holds the current token.
+			if got.Source != FetchSourceRedis || got.Token != first.Token || h.issuer.callCount() != 1 {
 				t.Fatalf("stale report = source %s calls %d", got.Source, h.issuer.callCount())
 			}
 		})

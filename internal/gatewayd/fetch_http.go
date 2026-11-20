@@ -20,7 +20,8 @@ type FetchOptions struct {
 }
 
 type fetchRequest struct {
-	FailedTokenSHA256 *string `json:"failed_token_sha256"`
+	// Raw so that an explicit null is distinguishable from an absent field.
+	FailedTokenSHA256 json.RawMessage `json:"failed_token_sha256"`
 }
 
 type fetchResponse struct {
@@ -110,6 +111,11 @@ func decodeFetchRequest(writer http.ResponseWriter, request *http.Request) (stri
 	if len(bytes.TrimSpace(data)) == 0 {
 		return "", true
 	}
+	// A non-empty body must be a JSON object: null, arrays and scalars are bad
+	// requests, not an alias for {}.
+	if trimmed := bytes.TrimSpace(data); len(trimmed) == 0 || trimmed[0] != '{' {
+		return "", false
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var parsed fetchRequest
@@ -119,13 +125,16 @@ func decodeFetchRequest(writer http.ResponseWriter, request *http.Request) (stri
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
 		return "", false
 	}
-	if parsed.FailedTokenSHA256 == nil {
+	if len(parsed.FailedTokenSHA256) == 0 {
 		return "", true
 	}
-	if !sha256HexPattern.MatchString(*parsed.FailedTokenSHA256) {
+	// A present field must be a JSON string holding the lowercase digest; null
+	// (which json would otherwise leave as the empty string) is rejected.
+	var failed string
+	if parsed.FailedTokenSHA256[0] != '"' || json.Unmarshal(parsed.FailedTokenSHA256, &failed) != nil || !sha256HexPattern.MatchString(failed) {
 		return "", false
 	}
-	return *parsed.FailedTokenSHA256, true
+	return failed, true
 }
 
 func writeFetchError(writer http.ResponseWriter, status int, code string) {

@@ -22,6 +22,8 @@ type approvalStore interface {
 	// TTL returns the key's remaining lifetime; negative when absent, so one
 	// PTTL answers presence and freshness atomically.
 	TTL(ctx context.Context, key string) (time.Duration, error)
+	// GetWithTTL reads the value and its remaining lifetime atomically.
+	GetWithTTL(ctx context.Context, key string) (value string, ttl time.Duration, present bool, err error)
 	// Held reports whether key exists, used to observe the issuance lock.
 	Held(ctx context.Context, key string) (bool, error)
 }
@@ -146,25 +148,27 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 	if ttl > tokenExpiryBuffer && (!force || ttl > prevTTL) {
 		return EnsureStateFresh, nil
 	}
-	issuedToken, err := s.issueAndStore(ctx)
-	if err != nil {
+	if _, err := s.issueAndStore(ctx, issuanceLock{key: s.lockKey, value: lock}); err != nil {
 		return "", errEnsureUnavailable
 	}
-	s.memory.put(issuedToken)
 	return EnsureStateIssued, nil
 }
 
 // issueAndStore performs one approval-key issue and writes Redis (raw key,
-// 23 h TTL) exactly as /ensure does. The caller owns the issuance lock.
-func (s *approvalService) issueAndStore(ctx context.Context) (FetchedToken, error) {
-	issued, err := s.issuer.Issue(ctx, s.config.AppKey, s.config.AppSecret)
-	if err != nil || strings.TrimSpace(issued.AccessToken) == "" {
-		return FetchedToken{}, errEnsureUnavailable
-	}
-	if err := s.store.Set(ctx, s.cacheKey, issued.AccessToken, approvalTTL); err != nil {
-		return FetchedToken{}, errEnsureUnavailable
-	}
-	return newFetchedToken(issued.AccessToken, s.now().Add(approvalTTL)), nil
+// 23 h TTL) exactly as /ensure does. The caller owns lock; publication is
+// conditional on still holding it and bounded by its lease.
+func (s *approvalService) issueAndStore(ctx context.Context, lock issuanceLock) (FetchedToken, error) {
+	return issueAndPublish(ctx, s.memory, approvalLockTTL, s.now, s.readRedis,
+		func(work context.Context) (FetchedToken, func(context.Context) error, error) {
+			issued, err := s.issuer.Issue(work, s.config.AppKey, s.config.AppSecret)
+			if err != nil || strings.TrimSpace(issued.AccessToken) == "" {
+				return FetchedToken{}, nil, errEnsureUnavailable
+			}
+			token := newFetchedToken(issued.AccessToken, s.now().Add(approvalTTL))
+			return token, func(c context.Context) error {
+				return s.store.SetIfLockHeld(c, lock.key, lock.value, s.cacheKey, issued.AccessToken, approvalTTL)
+			}, nil
+		})
 }
 
 type approvalIssuer struct {

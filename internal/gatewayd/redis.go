@@ -19,7 +19,12 @@ const (
 	redisReplyLimit  = 128 * 1024
 )
 
-var errRedisUnavailable = errors.New("redis unavailable")
+var (
+	errRedisUnavailable = errors.New("redis unavailable")
+	// errLockLost reports that a lock-conditional write found the lock gone or
+	// owned by someone else.
+	errLockLost = errors.New("redis lock lost")
+)
 
 // RedisStore is the narrow capability set required by the issuer. The
 // read-only KIS paths retain their separate GET-only client.
@@ -28,6 +33,10 @@ type RedisStore interface {
 	Set(ctx context.Context, key, value string, ttl time.Duration) error
 	SetNX(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 	CompareAndDelete(ctx context.Context, key, value string) error
+	// SetIfLockHeld stores key=value with an EX TTL only while lockKey still
+	// holds lockValue, so an issuer whose lease expired cannot overwrite a
+	// successor's publication. It returns errLockLost when the lock is not held.
+	SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error
 }
 
 // RedisClient is a small RESP client for the issuer's GET, SET, SET NX EX,
@@ -153,6 +162,48 @@ func (client *RedisClient) CompareAndDelete(ctx context.Context, key, value stri
 		return errRedisUnavailable
 	}
 	return nil
+}
+
+// SetIfLockHeld is SET ... EX guarded by lock ownership in one Lua call.
+func (client *RedisClient) SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error {
+	seconds, valid := redisTTLSeconds(ttl)
+	if !valid {
+		return errRedisUnavailable
+	}
+	const script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3]) else return false end"
+	reply, err := client.execute(ctx, "EVAL", script, "2", lockKey, key, lockValue, value, seconds)
+	if err != nil {
+		return errRedisUnavailable
+	}
+	if reply.nilValue {
+		return errLockLost
+	}
+	if reply.kind != '+' || reply.text != "OK" {
+		return errRedisUnavailable
+	}
+	return nil
+}
+
+// GetWithTTL reads a value and its remaining lifetime atomically. A missing key
+// is present=false; a key without expiry reports a non-positive ttl.
+func (client *RedisClient) GetWithTTL(ctx context.Context, key string) (string, time.Duration, bool, error) {
+	const script = "local v = redis.call('GET', KEYS[1]); if not v then return false end; return redis.call('PTTL', KEYS[1]) .. ':' .. v"
+	reply, err := client.execute(ctx, "EVAL", script, "1", key)
+	if err != nil {
+		return "", 0, false, errRedisUnavailable
+	}
+	if reply.nilValue {
+		return "", 0, false, nil
+	}
+	if reply.kind != '$' {
+		return "", 0, false, errRedisUnavailable
+	}
+	millis, value, found := strings.Cut(reply.text, ":")
+	ms, parseErr := strconv.ParseInt(millis, 10, 64)
+	if !found || parseErr != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) {
+		return "", 0, false, errRedisUnavailable
+	}
+	return value, time.Duration(ms) * time.Millisecond, true, nil
 }
 
 // Held reports whether key exists; the approval lock-wait loop uses it to

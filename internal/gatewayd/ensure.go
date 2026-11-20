@@ -161,33 +161,37 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 	if fresh {
 		return EnsureStateFresh, nil
 	}
-	issuedToken, err := service.issueAndStore(ctx)
-	if err != nil {
+	if _, err := service.issueAndStore(ctx, issuanceLock{key: service.LockKey, value: lockValue}); err != nil {
 		return "", errEnsureUnavailable
 	}
-	service.memory.put(issuedToken)
 	return EnsureStateIssued, nil
 }
 
 // issueAndStore performs one OAuth issue and writes Redis (same key, payload and
-// TTL as always). The caller owns the provider's Redis lock.
-func (service *EnsureService) issueAndStore(ctx context.Context) (FetchedToken, error) {
-	issued, err := service.OAuth.Issue(ctx, service.AppKey, service.AppSecret)
-	if err != nil || !validIssuedToken(issued, providerTokenExpiryBuffer(service.Provider)) {
-		return FetchedToken{}, errEnsureUnavailable
-	}
-	now := service.now()
-	payload, err := service.payload(issued.AccessToken, issued.ExpiresIn, now)
-	if err != nil {
-		return FetchedToken{}, errEnsureUnavailable
-	}
-	// Toss permits one valid token per client. A successful reissue invalidates
-	// the previous token, so publish the replacement while still owning this
-	// shared lock before any Python consumer can observe an unlocked stale key.
-	if err := service.Store.Set(ctx, service.CacheKey, payload, providerCacheTTL(service.Provider, issued.ExpiresIn)); err != nil {
-		return FetchedToken{}, errEnsureUnavailable
-	}
-	return newFetchedToken(issued.AccessToken, now.Add(time.Duration(issued.ExpiresIn)*time.Second)), nil
+// TTL as always). The caller owns lock; publication is conditional on still
+// holding it, bounded by its lease, and published to memory on success.
+func (service *EnsureService) issueAndStore(ctx context.Context, lock issuanceLock) (FetchedToken, error) {
+	return issueAndPublish(ctx, service.memory, lockTTL, service.now, service.readRedis,
+		func(work context.Context) (FetchedToken, func(context.Context) error, error) {
+			issued, err := service.OAuth.Issue(work, service.AppKey, service.AppSecret)
+			if err != nil || !validIssuedToken(issued, providerTokenExpiryBuffer(service.Provider)) {
+				return FetchedToken{}, nil, errEnsureUnavailable
+			}
+			now := service.now()
+			payload, err := service.payload(issued.AccessToken, issued.ExpiresIn, now)
+			if err != nil {
+				return FetchedToken{}, nil, errEnsureUnavailable
+			}
+			ttl := providerCacheTTL(service.Provider, issued.ExpiresIn)
+			token := newFetchedToken(issued.AccessToken, now.Add(time.Duration(issued.ExpiresIn)*time.Second))
+			// Toss permits one valid token per client. A successful reissue
+			// invalidates the previous token, so publish the replacement while still
+			// owning this shared lock before any Python consumer can observe an
+			// unlocked stale key.
+			return token, func(c context.Context) error {
+				return service.Store.SetIfLockHeld(c, lock.key, lock.value, service.CacheKey, payload, ttl)
+			}, nil
+		})
 }
 
 func (service *EnsureService) payload(accessToken string, expiresIn int64, now time.Time) (string, error) {

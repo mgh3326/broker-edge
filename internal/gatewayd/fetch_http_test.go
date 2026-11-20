@@ -150,6 +150,11 @@ func TestFetchHTTPErrorContract(t *testing.T) {
 		{"non-string hash", "toss", credentialFillwire, `{"failed_token_sha256":5}`, 400, "bad_request"},
 		{"not json", "toss", credentialFillwire, `nope`, 400, "bad_request"},
 		{"trailing data", "toss", credentialFillwire, `{} {}`, 400, "bad_request"},
+		{"json null body", "toss", credentialFillwire, `null`, 400, "bad_request"},
+		{"null hash", "toss", credentialFillwire, `{"failed_token_sha256":null}`, 400, "bad_request"},
+		{"empty string hash", "toss", credentialFillwire, `{"failed_token_sha256":""}`, 400, "bad_request"},
+		{"array body", "toss", credentialFillwire, `[]`, 400, "bad_request"},
+		{"scalar body", "toss", credentialFillwire, `"x"`, 400, "bad_request"},
 		{"oversize body", "toss", credentialFillwire, `{"failed_token_sha256":"` + strings.Repeat("a", 5000) + `"}`, 400, "bad_request"},
 		{"lock contended", "kis-mock", credentialFillwire, failedHash, 503, "issue_unavailable"},
 	}
