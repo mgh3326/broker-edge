@@ -336,13 +336,17 @@ func TestFetchDoesNotCallTheBrokerWhenTheReplacedTokenCannotBeRecorded(t *testin
 func TestFetchLeaseIsMeasuredFromBeforeSetNX(t *testing.T) {
 	h := newFetchHarness(t, ProviderToss)
 	h.writeRedis(externalA, 3600)
-	h.store.getDelay = 150 * time.Millisecond
+	const readDelay = 400 * time.Millisecond
+	h.store.getDelay = readDelay
 	start := time.Now()
 	h.fetch(sha(externalA))
 	h.issuer.mu.Lock()
 	deadline := h.issuer.deadline
 	h.issuer.mu.Unlock()
-	if limit := start.Add(lockTTL - fetchLeaseMargin); !deadline.Before(limit) {
+	// SET NX is sent after the first read (one delay); a lease measured after the
+	// under-lock recheck and snapshot reads would end two delays later.
+	limit := start.Add(lockTTL - fetchLeaseMargin - publishReserve + readDelay + readDelay/2)
+	if !deadline.Before(limit) {
 		t.Fatalf("broker deadline %v is not before %v: the lease was measured after the recheck", deadline.Sub(start), limit.Sub(start))
 	}
 }
