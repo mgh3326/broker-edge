@@ -68,7 +68,8 @@ go run ./cmd/kis-mock-read overseas-order-history --from 20260901 --to 20260901 
 ## Provider-scoped token gateway: `gatewayd`
 
 `gatewayd` is a separate, loopback-only OAuth token issuer. It exposes
-`GET /healthz` and `POST /v1/tokens/{provider}/ensure`, where `provider` is the
+`GET /healthz`, `POST /v1/tokens/{provider}/ensure` and
+`POST /v1/tokens/{provider}/fetch`, where `provider` is the
 closed set `kis-mock`, `kis-live`, `toss`, `kis-live-approval`, or `kis-mock-approval`. The ensure response is only
 `{"state":"fresh"}` or `{"state":"issued"}`; it never includes a token.
 
@@ -107,8 +108,82 @@ approval-key replacement, publishing the new value atomically without first
 deleting the old value. Concurrent contenders wait for the lock holder.
 
 `gatewayd` has no order, command, intent, or execution endpoint. It exposes
-loopback `GET /metrics` with standard Go/process collectors and a bounded
-`gatewayd_ensure_results_total{provider,state}` counter.
+loopback `GET /metrics` with standard Go/process collectors and bounded
+`gatewayd_ensure_results_total{provider,state}` and
+`gatewayd_fetch_results_total{provider,outcome,source}` counters.
+
+### Token fetch: `POST /v1/tokens/{provider}/fetch`
+
+`/ensure` only acknowledges; `/fetch` returns the token itself, so a consumer
+needs neither Redis access nor a Redis read per use. gatewayd keeps one token
+per provider in memory and keeps Redis as its persistence. `/ensure` is
+unchanged, and so are the Redis keys, payloads and TTLs: Python consumers keep
+reading the same keys.
+
+Request: `Authorization: Bearer <consumer credential>` and a JSON body that is
+`{}` (an empty body counts as `{}`) or `{"failed_token_sha256":"<64 lowercase hex>"}`.
+Any other field is a `400`.
+
+```json
+{"provider":"toss","token":"<value>","expires_at":"2026-11-21T03:04:05Z",
+ "token_sha256":"<64 hex of token>","source":"memory"}
+```
+
+`source` is `memory`, `redis` (loaded or adopted from the existing Redis key)
+or `issued`. Responses carry `Cache-Control: no-store`. Errors are
+`{"error":"<code>"}` and never contain a token:
+
+| Status | `error` | When |
+| --- | --- | --- |
+| 401 | `unauthenticated` | no/unknown credential, or no consumer is configured |
+| 403 | `provider_not_allowed` | the consumer's list does not include the provider |
+| 404 | `unknown_provider` | not in the closed provider set, or not served by this gatewayd |
+| 400 | `bad_request` | unknown body field, malformed hash, bad JSON, body over 4 KiB |
+| 503 | `issue_unavailable` | Redis or the broker failed, or the issuance lock stayed contended (no fallback) |
+
+Semantics, per provider:
+
+- Without `failed_token_sha256`, a token with **more than 60 s** left is served
+  from memory with zero Redis reads. Otherwise gatewayd reads the Redis key; a
+  usable token there is adopted, else it issues under the same Redis lock
+  `/ensure` uses, writes Redis exactly as `/ensure` does, then memory.
+- With `failed_token_sha256` equal to the current token's hash, gatewayd
+  re-reads Redis first: a different unexpired token (written by another issuer,
+  e.g. AT Python in `self` mode) is adopted and returned. Otherwise it reissues
+  once under the lock. Concurrent reports of the same hash cause one issue.
+- With a hash that differs from the current token, the caller holds a stale
+  token: the current one is returned and nothing is issued.
+- The 60 s rule is the same for every provider; Toss's longer `/ensure` buffer
+  does not apply to `/fetch`.
+
+**Restart.** Nothing is lost on restart: when consumers are configured, the
+daemon loads each provider's current Redis token into memory at startup
+(read-only, never issuing), and a miss later does the same read. A restart
+therefore does not force a reissue, which matters because Toss allows one valid
+token per client and KIS limits rapid reissue.
+
+**Consumers.** `/fetch` is off until at least one consumer is configured; with
+none, it answers `401` to everyone. Set `GATEWAYD_FETCH_CONSUMERS_FILE` to a
+JSON file:
+
+```json
+{"consumers":[
+  {"name":"fillwire","credential_sha256":"<sha256 hex of the credential>","providers":["toss","kis-live-approval"]},
+  {"name":"other","credential_env":"OTHER_FETCH_CREDENTIAL","providers":["kis-mock"]}
+]}
+```
+
+Each consumer has exactly one of `credential_sha256` (the credential is never
+stored) or `credential_env` (the name of an env var holding a credential of at
+least 16 characters; it is hashed at startup), plus a non-empty provider list.
+Unknown fields, duplicate names or credentials, and unknown providers fail
+startup with the fixed `startup_failed` line. Credentials are compared in
+constant time and are never logged. The listener stays loopback-only; remote
+exposure is a separate decision.
+
+The token value never appears in logs, metric labels, error bodies or
+formatted output; log lines are fixed text and the provider label is bounded
+to the closed set (or `unknown`).
 
 ## Mock placement edge: `kis-mock-edge`
 
