@@ -59,13 +59,28 @@ func (entry *fetchEntry) usable(now time.Time, buffer time.Duration) bool {
 
 type fetchProvider struct {
 	source fetchSource
-	// issue serializes the miss path per provider so concurrent consumers that
-	// report the same failed token cause one reissue, not several. It is a
-	// channel so a waiting request still honors its context.
+	// issue serializes the miss path per provider. It is a channel so a waiting
+	// request still honors its context.
 	issue chan struct{}
 
 	mu    sync.RWMutex
 	entry *fetchEntry
+	// rejected is the hash of a token a consumer reported failed and that is
+	// still current. It is never served (memory or Redis) until a different
+	// usable token replaces it, so a failed replacement cannot leave callers
+	// holding the dead token.
+	rejected string
+
+	attemptMu sync.Mutex
+	attempts  map[string]*fetchAttempt
+}
+
+// fetchAttempt is one in-flight replacement of a rejected token. Overlapping
+// requests for the same rejected hash share its result, including a failure.
+type fetchAttempt struct {
+	done   chan struct{}
+	result FetchResult
+	err    error
 }
 
 func (provider *fetchProvider) current() *fetchEntry {
@@ -74,10 +89,50 @@ func (provider *fetchProvider) current() *fetchEntry {
 	return provider.entry
 }
 
+func (provider *fetchProvider) rejectedSHA() string {
+	provider.mu.RLock()
+	defer provider.mu.RUnlock()
+	return provider.rejected
+}
+
+// remember stores the current token; a different token ends the rejection.
 func (provider *fetchProvider) remember(entry *fetchEntry) {
 	provider.mu.Lock()
 	provider.entry = entry
+	if provider.rejected != "" && entry.sha256 != provider.rejected {
+		provider.rejected = ""
+	}
 	provider.mu.Unlock()
+}
+
+// reject marks a confirmed-failed token and drops it from memory.
+func (provider *fetchProvider) reject(sha string) {
+	provider.mu.Lock()
+	provider.rejected = sha
+	if provider.entry != nil && provider.entry.sha256 == sha {
+		provider.entry = nil
+	}
+	provider.mu.Unlock()
+}
+
+// join registers the caller as leader of the attempt for a rejected hash, or
+// returns the attempt already running for it.
+func (provider *fetchProvider) join(sha string) (*fetchAttempt, bool) {
+	provider.attemptMu.Lock()
+	defer provider.attemptMu.Unlock()
+	if attempt, running := provider.attempts[sha]; running {
+		return attempt, false
+	}
+	attempt := &fetchAttempt{done: make(chan struct{})}
+	provider.attempts[sha] = attempt
+	return attempt, true
+}
+
+func (provider *fetchProvider) finish(sha string, attempt *fetchAttempt) {
+	provider.attemptMu.Lock()
+	delete(provider.attempts, sha)
+	provider.attemptMu.Unlock()
+	close(attempt.done)
 }
 
 type fetchConsumer struct {
@@ -116,7 +171,7 @@ func NewFetchService(ensurers ProviderEnsurers, store TokenReadStore, consumers 
 	}
 	for provider, ensurer := range ensurers {
 		if source, ok := ensurer.(fetchSource); ok && knownProvider(provider) {
-			service.providers[provider] = &fetchProvider{source: source, issue: make(chan struct{}, 1)}
+			service.providers[provider] = &fetchProvider{source: source, issue: make(chan struct{}, 1), attempts: make(map[string]*fetchAttempt)}
 		}
 	}
 	for _, consumer := range consumers {
@@ -235,37 +290,75 @@ func (service *FetchService) fetch(ctx context.Context, provider TokenProvider, 
 	if !found {
 		return FetchResult{}, errFetchUnavailable
 	}
-	if entry := state.current(); entry.usable(service.now(), fetchFreshBuffer) && entry.sha256 != failedSHA {
-		return entry.result(provider, fetchSourceMemory), nil
+	// Only a request with no failure report may be answered from memory alone:
+	// a report must be checked against Redis, which is the shared record.
+	if failedSHA == "" {
+		if result, hit := service.memoryHit(state, provider); hit {
+			return result, nil
+		}
 	}
+	replacing := failedSHA
+	if replacing == "" {
+		replacing = state.rejectedSHA()
+	}
+	if replacing == "" {
+		return service.refresh(ctx, provider, state, failedSHA)
+	}
+	attempt, leader := state.join(replacing)
+	if !leader {
+		select {
+		case <-attempt.done:
+			return attempt.result, attempt.err
+		case <-ctx.Done():
+			return FetchResult{}, errFetchUnavailable
+		}
+	}
+	defer state.finish(replacing, attempt)
+	attempt.result, attempt.err = service.refresh(ctx, provider, state, failedSHA)
+	return attempt.result, attempt.err
+}
 
+func (service *FetchService) memoryHit(state *fetchProvider, provider TokenProvider) (FetchResult, bool) {
+	entry := state.current()
+	if entry.usable(service.now(), fetchFreshBuffer) && entry.sha256 != state.rejectedSHA() {
+		return entry.result(provider, fetchSourceMemory), true
+	}
+	return FetchResult{}, false
+}
+
+// refresh is the miss path, run by one request at a time per provider.
+func (service *FetchService) refresh(ctx context.Context, provider TokenProvider, state *fetchProvider, failedSHA string) (FetchResult, error) {
 	select {
 	case state.issue <- struct{}{}:
 		defer func() { <-state.issue }()
 	case <-ctx.Done():
 		return FetchResult{}, errFetchUnavailable
 	}
-	// Another request may have refreshed memory while this one waited.
-	if entry := state.current(); entry.usable(service.now(), fetchFreshBuffer) && entry.sha256 != failedSHA {
-		return entry.result(provider, fetchSourceMemory), nil
+	if failedSHA == "" {
+		// Another request may have refreshed memory while this one waited.
+		if result, hit := service.memoryHit(state, provider); hit {
+			return result, nil
+		}
 	}
 
+	// Redis is the shared record of the current token. A token is dead if the
+	// caller reported it or an earlier report already condemned it; a caller
+	// reporting some other token is stale and gets the current one.
+	rejected := state.rejectedSHA()
 	force := false
-	if failedSHA != "" {
-		// Redis is the shared record of the current token. A caller reporting a
-		// different token than Redis holds is stale: answer with the current one.
+	currentSHA := ""
+	if failedSHA != "" || rejected != "" {
 		current, err := service.snapshot(ctx, provider, state.source.tokenKey())
 		if err != nil {
 			return FetchResult{}, err
 		}
 		if current != nil {
-			if current.sha256 != failedSHA {
-				if current.usable(service.now(), fetchFreshBuffer) {
-					state.remember(current)
-					return current.result(provider, fetchSourceRedis), nil
-				}
-			} else {
-				force = true
+			if current.sha256 == failedSHA || current.sha256 == rejected {
+				force, currentSHA = true, current.sha256
+				state.reject(currentSHA)
+			} else if current.usable(service.now(), fetchFreshBuffer) {
+				state.remember(current)
+				return current.result(provider, fetchSourceRedis), nil
 			}
 		}
 	}
@@ -273,7 +366,7 @@ func (service *FetchService) fetch(ctx context.Context, provider TokenProvider, 
 	var ensured EnsureState
 	var err error
 	if force {
-		ensured, err = state.source.EnsureReplacing(ctx, failedSHA)
+		ensured, err = state.source.EnsureReplacing(ctx, currentSHA)
 	} else {
 		ensured, err = state.source.Ensure(ctx)
 	}
@@ -284,10 +377,10 @@ func (service *FetchService) fetch(ctx context.Context, provider TokenProvider, 
 	if err != nil || current == nil {
 		return FetchResult{}, errFetchUnavailable
 	}
-	// The token the consumer just rejected is still current: reissue did not
-	// replace it (contended lock, or the broker returned the same token). Report
-	// that instead of looping.
-	if failedSHA != "" && current.sha256 == failedSHA {
+	// A token the consumer rejected is still current: reissue did not replace it
+	// (contended lock, or the broker returned the same token). Report that
+	// instead of looping, and never hand it out.
+	if (failedSHA != "" && current.sha256 == failedSHA) || current.sha256 == state.rejectedSHA() {
 		return FetchResult{}, errFetchUnavailable
 	}
 	state.remember(current)

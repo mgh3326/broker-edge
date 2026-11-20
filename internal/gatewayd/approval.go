@@ -147,7 +147,12 @@ func (s *approvalService) ensureReplacing(ctx context.Context, force bool, rejec
 			return "", errEnsureUnavailable
 		}
 		if present && strings.TrimSpace(current) != "" && tokenSHA256(current) != rejectedSHA {
-			return EnsureStateFresh, nil
+			// Yield only to a replacement that is itself still usable.
+			if ttl, err := s.cachedTTL(ctx); err != nil {
+				return "", err
+			} else if ttl > tokenExpiryBuffer {
+				return EnsureStateFresh, nil
+			}
 		}
 	}
 	// A publish may have landed between the last Held() observation and our

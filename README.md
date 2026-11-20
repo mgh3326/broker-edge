@@ -126,7 +126,10 @@ script execution and keeps the result in gatewayd's memory. `/ensure` and
 - Without a failed hash, a token with more than 60 s left is served from memory
   (zero Redis calls); otherwise `Ensure` runs. A failed hash equal to the
   current token's hash forces a reissue under the lock; a different hash means
-  the caller is stale and gets the current token without a reissue. If the token
+  the caller is stale and gets the current token (read from Redis, never from
+  memory alone) without a reissue. A token confirmed failed is not served again
+  until a different usable token replaces it; overlapping reports of the same
+  failed token share one reissue attempt. If the token
   the caller reported as failed is still current after the reissue (contended
   lock, or the broker returned the same token), the answer is
   `503 issue_unavailable` — there is no retry loop.

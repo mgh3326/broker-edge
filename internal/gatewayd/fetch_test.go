@@ -411,7 +411,7 @@ func TestFetchFailedHashDifferingReturnsCurrentWithoutReissue(t *testing.T) {
 		// Warm memory.
 		h.seed("current-token")
 		wantToken(t, h.fetchBody(`{}`), "current-token", "redis")
-		wantToken(t, h.fetchBody(stale), "current-token", "memory")
+		wantToken(t, h.fetchBody(stale), "current-token", "redis")
 
 		// Cold memory: the current token comes from Redis.
 		cold := newFetchHarness(t, h.provider)
@@ -830,4 +830,99 @@ func TestFetchForcedReissueYieldsToAPeerThatPublishedBeforeTheLock(t *testing.T)
 		}
 		wantToken(t, h.fetchBody(`{}`), "peer-token", "memory")
 	})
+}
+
+// A failure report is checked against Redis even when memory holds a token
+// that differs from the reported one (memory can be stale: /ensure?force=true
+// or a peer may have replaced the key).
+func TestFetchFailureReportChecksRedisInsteadOfTrustingMemory(t *testing.T) {
+	eachFetchProvider(t, func(t *testing.T, h *fetchHarness) {
+		h.seed("token-b")
+		wantToken(t, h.fetchBody(`{}`), "token-b", "redis")
+		h.seed("token-c") // published behind the cache's back
+		reads := h.store.of("read")
+		reply := h.fetchBody(`{"failed_token_sha256":"` + shaHex("token-a") + `"}`)
+		wantToken(t, reply, "token-c", "redis")
+		if h.store.of("read") == reads {
+			t.Fatal("a failure report was answered without reading Redis")
+		}
+		if h.issuer.callCount() != 0 {
+			t.Fatal("a stale report caused a reissue")
+		}
+	})
+}
+
+// Overlapping reports of the same failed token share one attempt, including
+// its failure; a later independent request may retry.
+func TestFetchOverlappingReportsShareTheAttemptAndItsFailure(t *testing.T) {
+	h := newFetchHarness(t, ProviderKISMock)
+	h.issue("token-a")
+	wantToken(t, h.fetchBody(`{}`), "token-a", "issued")
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	h.issuer.mu.Lock()
+	h.issuer.started, h.issuer.release = started, release
+	h.issuer.mu.Unlock()
+	body := `{"failed_token_sha256":"` + shaHex("token-a") + `"}`
+	replies := make(chan fetchReply, 2)
+	go func() { replies <- h.fetchBody(body) }()
+	<-started // the leader is inside the broker call
+	go func() { replies <- h.fetchBody(body) }()
+	time.Sleep(100 * time.Millisecond) // let the follower join the attempt
+	close(release)
+	for range 2 {
+		if reply := <-replies; reply.code != http.StatusServiceUnavailable || reply.raw != `{"error":"issue_unavailable"}` {
+			t.Fatalf("reply = %d %q", reply.code, reply.raw)
+		}
+	}
+	if h.issuer.callCount() != 2 {
+		t.Fatalf("issuer calls = %d, want initial plus one shared forced issue", h.issuer.callCount())
+	}
+	// A later independent request is eligible to retry.
+	if reply := h.fetchBody(body); reply.code != http.StatusServiceUnavailable || h.issuer.callCount() != 3 {
+		t.Fatalf("later retry = %d, issuer calls %d, want a new attempt", reply.code, h.issuer.callCount())
+	}
+}
+
+// Once a token is confirmed failed it is not handed out again, from memory or
+// Redis, even if the replacement could not be stored; a later request retries.
+func TestFetchConfirmedFailedTokenIsNotServedWhileRecovering(t *testing.T) {
+	eachFetchProvider(t, func(t *testing.T, h *fetchHarness) {
+		h.issue("token-a")
+		wantToken(t, h.fetchBody(`{}`), "token-a", "issued")
+		h.issue("token-b")
+		h.store.setErr = context.DeadlineExceeded // the broker issues B, publishing fails
+		body := `{"failed_token_sha256":"` + shaHex("token-a") + `"}`
+		if reply := h.fetchBody(body); reply.code != http.StatusServiceUnavailable {
+			t.Fatalf("report reply = %d", reply.code)
+		}
+		for range 2 {
+			reply := h.fetchBody(`{}`)
+			if reply.code != http.StatusServiceUnavailable || strings.Contains(reply.raw, "token-a") {
+				t.Fatalf("ordinary fetch while recovering = %d %q", reply.code, reply.raw)
+			}
+		}
+		h.store.setErr = nil
+		wantToken(t, h.fetchBody(`{}`), "token-b", "issued")
+		wantToken(t, h.fetchBody(`{}`), "token-b", "memory")
+	})
+}
+
+// An approval key a peer published must itself be usable before the forced
+// reissue yields to it.
+func TestFetchForcedApprovalReissueDoesNotYieldToANearlyExpiredPeerKey(t *testing.T) {
+	for _, provider := range []TokenProvider{ProviderKISMockApproval, ProviderKISLiveApproval} {
+		t.Run(string(provider), func(t *testing.T) {
+			h := newFetchHarness(t, provider)
+			h.seed("rejected-key")
+			wantToken(t, h.fetchBody(`{}`), "rejected-key", "redis")
+			h.issue("fresh-key")
+			var once sync.Once
+			h.store.setNXHook = func() {
+				once.Do(func() { h.store.save(h.ensurer.tokenKey(), "peer-short-lived", 30*time.Second) })
+			}
+			reply := h.fetchBody(`{"failed_token_sha256":"` + shaHex("rejected-key") + `"}`)
+			wantToken(t, reply, "fresh-key", "issued")
+		})
+	}
 }
