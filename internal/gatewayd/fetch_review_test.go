@@ -349,9 +349,11 @@ func TestFetchLeaseIsMeasuredFromBeforeSetNX(t *testing.T) {
 	h.issuer.mu.Lock()
 	deadline := h.issuer.deadline
 	h.issuer.mu.Unlock()
-	// SET NX is sent after the first read (one delay); a lease measured after the
-	// under-lock recheck and snapshot reads would end two delays later.
-	limit := start.Add(lockTTL - fetchLeaseMargin - publishReserve + readDelay + readDelay/2)
+	// SET NX is sent after the report's baseline read and the first resolve (two
+	// delays); a lease measured after the under-lock recheck and snapshot reads
+	// would end two delays later still.
+	publishTail, reconcileTail := leaseReserves(lockTTL)
+	limit := start.Add(lockTTL - fetchLeaseMargin - publishTail - reconcileTail + 2*readDelay + readDelay/2)
 	if !deadline.Before(limit) {
 		t.Fatalf("broker deadline %v is not before %v: the lease was measured after the recheck", deadline.Sub(start), limit.Sub(start))
 	}
@@ -360,7 +362,8 @@ func TestFetchLeaseIsMeasuredFromBeforeSetNX(t *testing.T) {
 func TestIssuanceRefusesToStartWithoutEnoughLeaseLeft(t *testing.T) {
 	h := newFetchHarness(t, ProviderToss)
 	service := h.ensurer.(*EnsureService)
-	for name, remaining := range map[string]time.Duration{"expired": -time.Second, "too short": minIssueWindow + publishReserve - time.Second} {
+	toss1, toss2 := leaseReserves(lockTTL)
+	for name, remaining := range map[string]time.Duration{"expired": -time.Second, "too short": minIssueWindow + toss1 + toss2 - time.Second} {
 		lock := issuanceLock{key: h.lockKey, value: "v", deadline: time.Now().Add(remaining)}
 		if _, err := service.issueAndStore(context.Background(), lock); err == nil {
 			t.Fatalf("%s: issuance started", name)

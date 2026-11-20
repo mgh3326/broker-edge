@@ -236,3 +236,80 @@ func TestEnsureWithdrawsTheTossPredecessorBeforeRotation(t *testing.T) {
 		t.Fatal("ensure rotated a token that was still readable in Redis")
 	}
 }
+
+// The lease budget must leave the broker its configured HTTP timeout (10 s by
+// default): a 15 s approval lease cannot spend most of itself on reserves.
+func TestIssuanceLeavesTheBrokerItsFullHTTPTimeout(t *testing.T) {
+	const brokerHTTPTimeout = 10 * time.Second
+	for _, provider := range fetchProviders {
+		t.Run(string(provider), func(t *testing.T) {
+			h := newFetchHarness(t, provider)
+			start := time.Now()
+			h.fetch("")
+			h.issuer.mu.Lock()
+			deadline := h.issuer.deadline
+			h.issuer.mu.Unlock()
+			if room := deadline.Sub(start); room < brokerHTTPTimeout {
+				t.Fatalf("the broker call is cut off after %v, shorter than its %v timeout", room, brokerHTTPTimeout)
+			}
+		})
+	}
+}
+
+// A Redis miss is not evidence that a Toss memory token is current: a peer's
+// rotation withdraws the key first, and the memory token may already be
+// replaced. Such reports go through the lock instead of being answered from memory.
+func TestTossFailureReportOnARedisMissDoesNotReturnTheMemoryToken(t *testing.T) {
+	setup := func(t *testing.T, provider TokenProvider) (*fetchHarness, FetchedToken) {
+		h := newFetchHarness(t, provider)
+		held := h.fetch("") // memory holds X
+		// A peer replaced X with Y, handed Y out, and is now rotating Y: it has
+		// withdrawn the shared key and holds the issuance lock.
+		h.store.mu.Lock()
+		delete(h.store.values, h.cacheKey)
+		h.store.mu.Unlock()
+		return h, held
+	}
+	t.Run("peer holds the lock: wait, never the memory token", func(t *testing.T) {
+		h, held := setup(t, ProviderToss)
+		h.store.mu.Lock()
+		h.store.locks[h.lockKey] = storedValue{value: "peer", expiresAt: h.now.Add(time.Minute)}
+		h.store.mu.Unlock()
+		got, err := h.fetcher.Fetch(context.Background(), sha("Y-handed-out-by-the-peer"))
+		if err == nil {
+			t.Fatalf("answered from %s with the replaced token (%v)", got.Source, got.Token == held.Token)
+		}
+		if h.issuer.callCount() != 1 {
+			t.Fatal("issued while a peer held the lock")
+		}
+	})
+	t.Run("peer published: its token is returned", func(t *testing.T) {
+		h, held := setup(t, ProviderToss)
+		h.store.mu.Lock()
+		h.store.locks[h.lockKey] = storedValue{value: "peer", expiresAt: h.now.Add(time.Minute)}
+		h.store.mu.Unlock()
+		h.fetcher.LockWaitTimeout = 2 * time.Second
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			h.writeRedis(externalB, 3600)
+		}()
+		got, err := h.fetcher.Fetch(context.Background(), sha("Y-handed-out-by-the-peer"))
+		if err != nil || got.Token != externalB || got.Token == held.Token {
+			t.Fatalf("got %s %v", got.Source, err)
+		}
+	})
+	t.Run("no peer rotation: recover under the lock", func(t *testing.T) {
+		h, held := setup(t, ProviderToss)
+		got := h.fetch(sha("Y-handed-out-by-the-peer"))
+		if got.Source != FetchSourceIssued || got.Token == held.Token {
+			t.Fatalf("source %s", got.Source)
+		}
+	})
+	t.Run("providers whose issue invalidates nothing keep the memory answer", func(t *testing.T) {
+		h, held := setup(t, ProviderKISMock)
+		got := h.fetch(sha("a-token-this-caller-held"))
+		if got.Source != FetchSourceMemory || got.Token != held.Token || h.issuer.callCount() != 1 {
+			t.Fatalf("source %s", got.Source)
+		}
+	})
+}

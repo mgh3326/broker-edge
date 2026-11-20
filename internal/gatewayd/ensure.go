@@ -176,7 +176,7 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 // withdrawal and reconciliation rules. It publishes to memory on success.
 func (service *EnsureService) issueAndStore(ctx context.Context, lock issuanceLock) (FetchedToken, error) {
 	return issueAndPublish(ctx, issuancePlan{
-		memory: service.memory, lock: lock, now: service.now, readRedis: service.readRedis,
+		memory: service.memory, lock: lock, lease: lockTTL, now: service.now, readRedis: service.readRedis,
 		// Toss permits one valid token per client: issuing invalidates the old one,
 		// so the old record is withdrawn from the shared key before the broker call.
 		singleToken: service.Provider == ProviderToss,

@@ -205,6 +205,8 @@ type fetchBackend interface {
 	issueAndStore(ctx context.Context, lock issuanceLock) (FetchedToken, error)
 	redisLockKey() string
 	redisLockTTL() time.Duration
+	// singleTokenProvider is true when issuing invalidates the previous token.
+	singleTokenProvider() bool
 }
 
 const (
@@ -225,12 +227,31 @@ const (
 	serverExpiryTolerance = 5 * time.Millisecond
 )
 
-// Lease budget slices (variables only so tests can shrink them).
+// Lease budget slices: upper bounds (variables only so tests can shrink them).
+// A short lease scales them down (see leaseReserves) so the broker keeps room for
+// its own timeout.
 var (
 	publishReserve   = 3 * time.Second
 	reconcileReserve = 3 * time.Second
 	minIssueWindow   = 4 * time.Second
 )
+
+// leaseReserves is the part of the lease kept back for publishing and for
+// reconciling a publish: the configured maxima, at most 1/15 of the lease each
+// (a 15 s approval lease keeps 1 s each, leaving the broker its full 10 s HTTP
+// timeout; a 30 s Toss lease keeps 2 s each). lease == 0 means "use the maxima".
+func leaseReserves(lease time.Duration) (publish, reconcile time.Duration) {
+	publish, reconcile = publishReserve, reconcileReserve
+	if lease > 0 {
+		if scaled := lease / 15; scaled < publish {
+			publish = scaled
+		}
+		if scaled := lease / 15; scaled < reconcile {
+			reconcile = scaled
+		}
+	}
+	return publish, reconcile
+}
 
 var errIssueFailed = errors.New("token issue failed")
 
@@ -246,8 +267,10 @@ type issuedToken struct {
 
 // issuancePlan is one lock-owned issuance.
 type issuancePlan struct {
-	memory    *tokenMemory
-	lock      issuanceLock
+	memory *tokenMemory
+	lock   issuanceLock
+	// lease is the lock's TTL, used to scale the publish/reconcile reserves.
+	lease     time.Duration
 	now       func() time.Time
 	readRedis func(context.Context, time.Time) (FetchedToken, bool, error)
 	issue     func(context.Context) (issuedToken, error)
@@ -277,7 +300,8 @@ type issuancePlan struct {
 //   - A publish whose reply was lost is confirmed by reading the record back;
 //     a committed replacement is never removed or reissued.
 func issueAndPublish(ctx context.Context, plan issuancePlan) (FetchedToken, error) {
-	need := minIssueWindow + publishReserve + reconcileReserve
+	publishTail, reconcileTail := leaseReserves(plan.lease)
+	need := minIssueWindow + publishTail + reconcileTail
 	if ctx.Err() != nil || time.Until(plan.lock.deadline) < need {
 		return FetchedToken{}, errIssueFailed
 	}
@@ -303,13 +327,13 @@ func issueAndPublish(ctx context.Context, plan issuancePlan) (FetchedToken, erro
 		}
 		plan.memory.revoke(replaced...)
 	}
-	brokerCtx, cancelBroker := context.WithDeadline(work, plan.lock.deadline.Add(-publishReserve-reconcileReserve))
+	brokerCtx, cancelBroker := context.WithDeadline(work, plan.lock.deadline.Add(-publishTail-reconcileTail))
 	issued, err := plan.issue(brokerCtx)
 	cancelBroker()
 	if err != nil {
 		return FetchedToken{}, errIssueFailed
 	}
-	publishCtx, cancelPublish := context.WithDeadline(work, plan.lock.deadline.Add(-reconcileReserve))
+	publishCtx, cancelPublish := context.WithDeadline(work, plan.lock.deadline.Add(-reconcileTail))
 	defer cancelPublish()
 	committed := false
 	for attempt := range publishAttempts {
@@ -461,7 +485,11 @@ func (f *Fetcher) Fetch(ctx context.Context, failedSHA256 string) (FetchedToken,
 		now := f.now()
 		redisHolds := observed != nil && observed.ExpiresAt.After(now) && !f.memory.isRevoked(observed.SHA256)
 		current, _ := f.memory.snapshot()
-		if !redisHolds && current.usable(now) && current.SHA256 != failedSHA256 {
+		// For a single-token provider a Redis miss is not evidence that memory is
+		// current: a peer's rotation withdraws the key first, and the memory token
+		// may be one the broker already replaced. Those reports go through the
+		// lock, wait for the peer's publication or recover under it.
+		if !redisHolds && !f.backend.singleTokenProvider() && current.usable(now) && current.SHA256 != failedSHA256 {
 			return current.from(FetchSourceMemory), nil
 		}
 	}
@@ -616,6 +644,7 @@ func (f *Fetcher) waitForPeer(ctx context.Context, failedSHA256 string, baseline
 
 func (service *EnsureService) redisLockKey() string        { return service.LockKey }
 func (service *EnsureService) redisLockTTL() time.Duration { return lockTTL }
+func (service *EnsureService) singleTokenProvider() bool   { return service.Provider == ProviderToss }
 
 func (service *EnsureService) readRedis(ctx context.Context, _ time.Time) (FetchedToken, bool, error) {
 	raw, present, err := service.Store.Get(ctx, service.CacheKey)
@@ -674,6 +703,7 @@ func parseCachedTokenPayload(provider TokenProvider, raw string) (string, time.T
 
 func (s *approvalService) redisLockKey() string        { return s.lockKey }
 func (s *approvalService) redisLockTTL() time.Duration { return approvalLockTTL }
+func (s *approvalService) singleTokenProvider() bool   { return false }
 
 // readRedis reads the raw approval key, its remaining TTL and its absolute
 // server-side expiry in one atomic Redis operation; the local expiry is now plus

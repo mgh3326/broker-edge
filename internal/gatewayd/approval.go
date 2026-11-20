@@ -166,7 +166,7 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 // replaced (an approval key's replacement does not invalidate it).
 func (s *approvalService) issueAndStore(ctx context.Context, lock issuanceLock) (FetchedToken, error) {
 	return issueAndPublish(ctx, issuancePlan{
-		memory: s.memory, lock: lock, now: s.now, readRedis: s.readRedis,
+		memory: s.memory, lock: lock, lease: approvalLockTTL, now: s.now, readRedis: s.readRedis,
 		issue: func(work context.Context) (issuedToken, error) {
 			issued, err := s.issuer.Issue(work, s.config.AppKey, s.config.AppSecret)
 			if err != nil || strings.TrimSpace(issued.AccessToken) == "" {
