@@ -2,6 +2,7 @@ package gatewayd
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +33,10 @@ type fakeRedisStore struct {
 	setNXErr error
 	delErr   error
 	deletes  []string
+	markers  map[string]string
+	// lostReply makes the next SetIfLockHeld commit and then report a transport
+	// error, as when the connection drops before the reply arrives.
+	lostReply bool
 
 	sets             []setRecord
 	setWhileLockHeld []bool
@@ -69,6 +74,7 @@ func (store *fakeRedisStore) Set(_ context.Context, key, value string, ttl time.
 		return store.setErr
 	}
 	store.values[key] = storedValue{value: value, expiresAt: store.now().Add(ttl)}
+	delete(store.markers, key)
 	store.sets = append(store.sets, setRecord{key: key, value: value, ttl: ttl})
 	store.setWhileLockHeld = append(store.setWhileLockHeld, store.hasActiveLockLocked())
 	return nil
@@ -116,6 +122,7 @@ func (store *fakeRedisStore) CompareAndDelete(_ context.Context, key, value stri
 func (store *fakeRedisStore) save(key, value string, ttl time.Duration) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	delete(store.markers, key)
 	store.values[key] = storedValue{value: value, expiresAt: store.now().Add(ttl)}
 }
 
@@ -259,7 +266,7 @@ func (store *fakeRedisStore) Held(_ context.Context, key string) (bool, error) {
 	return ok && (v.expiresAt.IsZero() || store.now().Before(v.expiresAt)), nil
 }
 
-func (store *fakeRedisStore) SetIfLockHeld(_ context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error {
+func (store *fakeRedisStore) SetIfLockHeld(_ context.Context, lockKey, lockValue, key, value string, ttl time.Duration, publication string) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.setErr != nil {
@@ -269,29 +276,42 @@ func (store *fakeRedisStore) SetIfLockHeld(_ context.Context, lockKey, lockValue
 	if !found || lock.value != lockValue || (!lock.expiresAt.IsZero() && !store.now().Before(lock.expiresAt)) {
 		return errLockLost
 	}
-	store.values[key] = storedValue{value: value, expiresAt: store.now().Add(ttl)}
+	expiresAt := store.now().Add(ttl)
+	store.values[key] = storedValue{value: value, expiresAt: expiresAt}
+	delete(store.markers, key)
+	if publication != "" {
+		if store.markers == nil {
+			store.markers = map[string]string{}
+		}
+		store.markers[key] = publication + "@" + strconv.FormatInt(expiresAt.UnixMilli(), 10)
+	}
 	store.sets = append(store.sets, setRecord{key: key, value: value, ttl: ttl})
 	store.setWhileLockHeld = append(store.setWhileLockHeld, true)
+	if store.lostReply {
+		store.lostReply = false
+		return errRedisUnavailable
+	}
 	return nil
 }
 
-func (store *fakeRedisStore) GetWithTTL(_ context.Context, key string) (string, time.Duration, int64, bool, error) {
+func (store *fakeRedisStore) GetWithTTL(_ context.Context, key string) (string, time.Duration, int64, string, bool, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.getErr != nil {
-		return "", 0, 0, false, store.getErr
+		return "", 0, 0, "", false, store.getErr
 	}
 	value, found := store.values[key]
 	if !found || (!value.expiresAt.IsZero() && !store.now().Before(value.expiresAt)) {
-		return "", 0, 0, false, nil
+		return "", 0, 0, "", false, nil
 	}
 	if value.expiresAt.IsZero() {
-		return value.value, -1, 0, true, nil
+		return value.value, -1, 0, "", true, nil
 	}
-	return value.value, value.expiresAt.Sub(store.now()), value.expiresAt.UnixMilli(), true, nil
+	serverExpiry := value.expiresAt.UnixMilli()
+	return value.value, value.expiresAt.Sub(store.now()), serverExpiry, boundPublication(store.markers[key], serverExpiry), true, nil
 }
 
-func (store *fakeRedisStore) DeleteIfLockHeld(_ context.Context, lockKey, lockValue, key string) error {
+func (store *fakeRedisStore) WithdrawIfLockHeld(_ context.Context, lockKey, lockValue, key, expected string) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.delErr != nil {
@@ -301,7 +321,11 @@ func (store *fakeRedisStore) DeleteIfLockHeld(_ context.Context, lockKey, lockVa
 	if !found || lock.value != lockValue || (!lock.expiresAt.IsZero() && !store.now().Before(lock.expiresAt)) {
 		return errLockLost
 	}
+	if current, present := store.values[key]; !present || current.value != expected {
+		return errStateChanged
+	}
 	delete(store.values, key)
+	delete(store.markers, key)
 	store.deletes = append(store.deletes, key)
 	return nil
 }

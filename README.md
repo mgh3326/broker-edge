@@ -156,6 +156,21 @@ Semantics, per provider:
 - The 60 s rule is the same for every provider; Toss's longer `/ensure` buffer
   does not apply to `/fetch`.
 
+**Toss rotation.** Toss allows one valid token per client, so rotating invalidates
+the token every consumer holds. While gatewayd owns the issuance lock it
+therefore withdraws the predecessor from the shared Redis key (only if the key
+still holds exactly what it read, and only while it still owns the lock) *before*
+it calls Toss, and then publishes the replacement under the same lock. Redis
+never advertises a token that is about to be invalidated: during the rotation the
+key is briefly missing, and if anything fails afterwards it stays missing, so a
+Python reader, `/ensure` or a restarted gateway reissues instead of using the
+dead token. A publish whose reply is lost is confirmed by reading the record
+back and is not reissued. Approval keys are not withdrawn (their replacement does
+not invalidate the old key); each gatewayd publication also writes a marker in
+the sibling key `<approval key>:gatewayd:publication`, bound to that record's
+expiry, so a report can tell a later publication of identical bytes from the one
+it observed. Legacy readers ignore the marker key.
+
 **Restart.** Nothing is lost on restart: when consumers are configured, the
 daemon loads each provider's current Redis token into memory at startup
 (read-only, never issuing), and a miss later does the same read. A restart

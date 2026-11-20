@@ -154,8 +154,11 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 	defer service.releaseLock(lockValue)
 
 	// A peer can populate the cache between the initial GET and SET NX. Check
-	// again while owning the lock before contacting the provider.
-	fresh, err = service.hasFreshToken(ctx)
+	// again while owning the lock before contacting the provider, within the
+	// lease measured from before SET NX.
+	leaseContext, cancelLease := context.WithDeadline(ctx, leaseDeadline(beforeSetNX, lockTTL))
+	fresh, err = service.hasFreshToken(leaseContext)
+	cancelLease()
 	if err != nil {
 		return "", err
 	}
@@ -169,32 +172,36 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 }
 
 // issueAndStore performs one OAuth issue and writes Redis (same key, payload and
-// TTL as always). The caller owns lock; publication is conditional on still
-// holding it, bounded by its lease, and published to memory on success.
+// TTL as always). The caller owns lock; see issueAndPublish for the lease,
+// withdrawal and reconciliation rules. It publishes to memory on success.
 func (service *EnsureService) issueAndStore(ctx context.Context, lock issuanceLock) (FetchedToken, error) {
 	return issueAndPublish(ctx, issuancePlan{
 		memory: service.memory, lock: lock, now: service.now, readRedis: service.readRedis,
-		invalidate: func(c context.Context) error {
-			return service.Store.DeleteIfLockHeld(c, lock.key, lock.value, service.CacheKey)
+		// Toss permits one valid token per client: issuing invalidates the old one,
+		// so the old record is withdrawn from the shared key before the broker call.
+		singleToken: service.Provider == ProviderToss,
+		withdraw: func(c context.Context, expected string) error {
+			return service.Store.WithdrawIfLockHeld(c, lock.key, lock.value, service.CacheKey, expected)
 		},
-		issue: func(work context.Context) (FetchedToken, func(context.Context) error, error) {
+		issue: func(work context.Context) (issuedToken, error) {
 			issued, err := service.OAuth.Issue(work, service.AppKey, service.AppSecret)
 			if err != nil || !validIssuedToken(issued, providerTokenExpiryBuffer(service.Provider)) {
-				return FetchedToken{}, nil, errEnsureUnavailable
+				return issuedToken{}, errEnsureUnavailable
 			}
 			now := service.now()
 			payload, err := service.payload(issued.AccessToken, issued.ExpiresIn, now)
 			if err != nil {
-				return FetchedToken{}, nil, errEnsureUnavailable
+				return issuedToken{}, errEnsureUnavailable
 			}
 			ttl := providerCacheTTL(service.Provider, issued.ExpiresIn)
 			token := newFetchedToken(issued.AccessToken, now.Add(time.Duration(issued.ExpiresIn)*time.Second))
-			// Toss permits one valid token per client. A successful reissue
-			// invalidates the previous token, so publish the replacement while still
-			// owning this shared lock before any Python consumer can observe an
-			// unlocked stale key.
-			return token, func(c context.Context) error {
-				return service.Store.SetIfLockHeld(c, lock.key, lock.value, service.CacheKey, payload, ttl)
+			token.Raw = payload
+			return issuedToken{
+				token: token,
+				publish: func(c context.Context) error {
+					return service.Store.SetIfLockHeld(c, lock.key, lock.value, service.CacheKey, payload, ttl, "")
+				},
+				committed: func(stored FetchedToken) bool { return stored.Raw == payload },
 			}, nil
 		},
 	})

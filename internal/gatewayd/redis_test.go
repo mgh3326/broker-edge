@@ -158,7 +158,7 @@ func readTestRESPArray(reader *bufio.Reader) ([]string, error) {
 		return nil, err
 	}
 	count, err := strconv.Atoi(countLine)
-	if err != nil || count < 1 || count > 8 {
+	if err != nil || count < 1 || count > 12 {
 		return nil, fmt.Errorf("array length")
 	}
 	arguments := make([]string, 0, count)
@@ -202,7 +202,16 @@ func TestRedisClientLockConditionalSetAndAtomicGetWithTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	replies := []string{"+OK\r\n", "$-1\r\n", "$34\r\n1763000061000:61000:approval:key-1\r\n", "$-1\r\n", ":1\r\n", "$-1\r\n"}
+	// "<server expiry ms>:<ttl ms>:<marker>:<value>"; the value itself may contain ':'.
+	marked := "1763000061000:61000:attempt1@1763000061010:approval:key-1"
+	unmarked := "1763000061000:61000::approval:key-1"
+	foreign := "1763000061000:61000:attempt1@1763009999999:approval:key-1"
+	replies := []string{
+		"+OK\r\n", "$-1\r\n",
+		fmt.Sprintf("$%d\r\n%s\r\n", len(marked), marked), fmt.Sprintf("$%d\r\n%s\r\n", len(unmarked), unmarked),
+		fmt.Sprintf("$%d\r\n%s\r\n", len(foreign), foreign), "$-1\r\n",
+		":1\r\n", "$-1\r\n", ":-1\r\n",
+	}
 	commands := make(chan []string, len(replies))
 	go func() {
 		defer close(commands)
@@ -224,35 +233,47 @@ func TestRedisClientLockConditionalSetAndAtomicGetWithTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if err := client.SetIfLockHeld(ctx, "lock", "owner", "cache", "payload", 60*time.Second); err != nil {
+	if err := client.SetIfLockHeld(ctx, "lock", "owner", "cache", "payload", 60*time.Second, "attempt1"); err != nil {
 		t.Fatalf("held lock: %v", err)
 	}
-	if err := client.SetIfLockHeld(ctx, "lock", "owner", "cache", "payload", 60*time.Second); !errors.Is(err, errLockLost) {
+	if err := client.SetIfLockHeld(ctx, "lock", "owner", "cache", "payload", 60*time.Second, ""); !errors.Is(err, errLockLost) {
 		t.Fatalf("lost lock err = %v", err)
 	}
-	value, ttl, serverExpiry, present, err := client.GetWithTTL(ctx, "cache")
-	if err != nil || !present || value != "approval:key-1" || ttl != 61*time.Second || serverExpiry != 1763000061000 {
-		t.Fatalf("GetWithTTL = %q %v %d %t %v", value, ttl, serverExpiry, present, err)
+	for _, c := range []struct{ name, want string }{{"marker bound to the record", "attempt1"}, {"no marker", ""}, {"marker of a different expiry", ""}} {
+		name, want := c.name, c.want
+		value, ttl, serverExpiry, publication, present, err := client.GetWithTTL(ctx, "cache")
+		if err != nil || !present || value != "approval:key-1" || ttl != 61*time.Second || serverExpiry != 1763000061000 || publication != want {
+			t.Fatalf("%s: GetWithTTL = %q %v %d %q %t %v", name, value, ttl, serverExpiry, publication, present, err)
+		}
 	}
-	if _, _, _, present, err := client.GetWithTTL(ctx, "cache"); err != nil || present {
+	if _, _, _, _, present, err := client.GetWithTTL(ctx, "cache"); err != nil || present {
 		t.Fatalf("missing key: present %t err %v", present, err)
 	}
-	if err := client.DeleteIfLockHeld(ctx, "lock", "owner", "cache"); err != nil {
-		t.Fatalf("delete held: %v", err)
+	if err := client.WithdrawIfLockHeld(ctx, "lock", "owner", "cache", "old"); err != nil {
+		t.Fatalf("withdraw: %v", err)
 	}
-	if err := client.DeleteIfLockHeld(ctx, "lock", "owner", "cache"); !errors.Is(err, errLockLost) {
-		t.Fatalf("delete lost err = %v", err)
+	if err := client.WithdrawIfLockHeld(ctx, "lock", "owner", "cache", "old"); !errors.Is(err, errLockLost) {
+		t.Fatalf("withdraw lost err = %v", err)
 	}
-	set, _, getWithTTL, _, del, _ := <-commands, <-commands, <-commands, <-commands, <-commands, <-commands
-	if set[0] != "EVAL" || set[2] != "2" || set[3] != "lock" || set[4] != "cache" || set[5] != "owner" || set[6] != "payload" || set[7] != "60" ||
+	if err := client.WithdrawIfLockHeld(ctx, "lock", "owner", "cache", "old"); !errors.Is(err, errStateChanged) {
+		t.Fatalf("withdraw changed err = %v", err)
+	}
+	var all [][]string
+	for command := range commands {
+		all = append(all, command)
+	}
+	set, getFirst, withdraw := all[0], all[2], all[6]
+	if set[0] != "EVAL" || set[2] != "3" || set[3] != "lock" || set[4] != "cache" || set[5] != "cache:gatewayd:publication" ||
+		set[6] != "owner" || set[7] != "payload" || set[8] != "60" || set[9] != "attempt1" ||
 		!strings.Contains(set[1], "'SET', KEYS[2]") || !strings.Contains(set[1], "'GET', KEYS[1]") {
 		t.Fatalf("SetIfLockHeld command = %q", set)
 	}
-	if getWithTTL[0] != "EVAL" || getWithTTL[2] != "1" || getWithTTL[3] != "cache" ||
-		!strings.Contains(getWithTTL[1], "'GET'") || !strings.Contains(getWithTTL[1], "'PTTL'") || !strings.Contains(getWithTTL[1], "'TIME'") {
-		t.Fatalf("GetWithTTL command = %q", getWithTTL)
+	if getFirst[0] != "EVAL" || getFirst[2] != "2" || getFirst[3] != "cache" || getFirst[4] != "cache:gatewayd:publication" ||
+		!strings.Contains(getFirst[1], "'PTTL'") || !strings.Contains(getFirst[1], "'TIME'") {
+		t.Fatalf("GetWithTTL command = %q", getFirst)
 	}
-	if del[0] != "EVAL" || del[2] != "2" || del[3] != "lock" || del[4] != "cache" || del[5] != "owner" || !strings.Contains(del[1], "'DEL', KEYS[2]") {
-		t.Fatalf("DeleteIfLockHeld command = %q", del)
+	if withdraw[0] != "EVAL" || withdraw[2] != "3" || withdraw[3] != "lock" || withdraw[4] != "cache" || withdraw[6] != "owner" || withdraw[7] != "old" ||
+		!strings.Contains(withdraw[1], "KEYS[1]") || !strings.Contains(withdraw[1], "ARGV[2]") {
+		t.Fatalf("WithdrawIfLockHeld command = %q", withdraw)
 	}
 }

@@ -30,13 +30,18 @@ var (
 //
 //	{"consumers":[{"name":"fillwire","credential_sha256":"<64 hex>"|"credential_env":"NAME","providers":["toss"]}]}
 type consumerFile struct {
-	Consumers []consumerEntry `json:"consumers"`
+	// A pointer so that a missing or null array is an error, not "no consumers";
+	// `{"consumers":[]}` stays the explicit way to switch the route off.
+	Consumers *[]consumerEntry `json:"consumers"`
 }
 
+// Credential fields are pointers so presence survives decoding: exactly one must
+// be present, and a present field with an empty value is an error rather than
+// indistinguishable from an absent one.
 type consumerEntry struct {
 	Name             string   `json:"name"`
-	CredentialSHA256 string   `json:"credential_sha256"`
-	CredentialEnv    string   `json:"credential_env"`
+	CredentialSHA256 *string  `json:"credential_sha256"`
+	CredentialEnv    *string  `json:"credential_env"`
 	Providers        []string `json:"providers"`
 }
 
@@ -114,10 +119,13 @@ func ParseFetchConsumers(data []byte, lookup func(string) string) (*ConsumerAuth
 	if _, err := decoder.Token(); err != io.EOF {
 		return nil, errConfiguration
 	}
+	if parsed.Consumers == nil {
+		return nil, errConfiguration
+	}
 	auth := &ConsumerAuth{}
-	names := make(map[string]struct{}, len(parsed.Consumers))
-	digests := make(map[[sha256.Size]byte]struct{}, len(parsed.Consumers))
-	for _, entry := range parsed.Consumers {
+	names := make(map[string]struct{}, len(*parsed.Consumers))
+	digests := make(map[[sha256.Size]byte]struct{}, len(*parsed.Consumers))
+	for _, entry := range *parsed.Consumers {
 		consumer, err := entry.build(lookup)
 		if err != nil {
 			return nil, errConfiguration
@@ -140,24 +148,24 @@ func (entry consumerEntry) build(lookup func(string) string) (fetchConsumer, err
 	if name == "" || len(entry.Providers) == 0 {
 		return fetchConsumer{}, errConfiguration
 	}
-	if (entry.CredentialSHA256 == "") == (entry.CredentialEnv == "") {
+	if (entry.CredentialSHA256 == nil) == (entry.CredentialEnv == nil) {
 		return fetchConsumer{}, errConfiguration
 	}
 	consumer := fetchConsumer{name: name, providers: make(map[TokenProvider]struct{}, len(entry.Providers))}
-	if entry.CredentialSHA256 != "" {
-		if !sha256HexPattern.MatchString(entry.CredentialSHA256) {
+	if entry.CredentialSHA256 != nil {
+		if !sha256HexPattern.MatchString(*entry.CredentialSHA256) {
 			return fetchConsumer{}, errConfiguration
 		}
-		decoded, err := hex.DecodeString(entry.CredentialSHA256)
+		decoded, err := hex.DecodeString(*entry.CredentialSHA256)
 		if err != nil || len(decoded) != sha256.Size {
 			return fetchConsumer{}, errConfiguration
 		}
 		copy(consumer.digest[:], decoded)
 	} else {
-		if !envNamePattern.MatchString(entry.CredentialEnv) {
+		if !envNamePattern.MatchString(*entry.CredentialEnv) {
 			return fetchConsumer{}, errConfiguration
 		}
-		credential := strings.TrimSpace(lookup(entry.CredentialEnv))
+		credential := strings.TrimSpace(lookup(*entry.CredentialEnv))
 		if len(credential) < minConsumerCredentialLength || !safeHeaderText(credential) {
 			return fetchConsumer{}, errConfiguration
 		}

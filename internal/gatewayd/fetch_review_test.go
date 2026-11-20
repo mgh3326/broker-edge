@@ -89,9 +89,9 @@ func TestFetchIssuanceCompletesAfterCallerCancels(t *testing.T) {
 		defer close(done)
 		_, _ = h.fetcher.Fetch(ctx, "")
 	}()
-	<-h.issuer.started
+	waitStarted(t, h.issuer.started)
 	cancel()
-	close(h.issuer.release)
+	h.issuer.releaseAll()
 	<-done
 	if records := h.store.savedRecords(); len(records) != 1 {
 		t.Fatalf("Redis writes after caller cancel = %d, want the rotated token published", len(records))
@@ -142,11 +142,11 @@ func TestFetchLateIssuerCannotOverwriteASuccessor(t *testing.T) {
 				_, err := h.fetcher.Fetch(context.Background(), "")
 				result <- err
 			}()
-			<-h.issuer.started
+			waitStarted(t, h.issuer.started)
 			h.store.mu.Lock()
 			h.store.locks[h.lockKey] = storedValue{value: "successor-lock", expiresAt: h.now.Add(time.Minute)}
 			h.store.mu.Unlock()
-			close(h.issuer.release)
+			h.issuer.releaseAll()
 			if err := <-result; err == nil {
 				t.Fatal("expected failure after losing the lock")
 			}
@@ -186,6 +186,11 @@ func TestFetchOverlappingReportsShareARefreshThatReturnsTheSameToken(t *testing.
 		t.Run(string(provider), func(t *testing.T) {
 			h := newFetchHarness(t, provider)
 			h.issuer.tokenFn = func(int) string { return sameToken }
+			if !isApprovalProvider(provider) {
+				// A payload record's expiry moves with the clock; real issues are
+				// never in the same instant.
+				h.issuer.onIssue = func() { h.now = h.now.Add(time.Second) }
+			}
 			first := h.fetch("")
 			// Hold the refresh open so every report is in flight before it completes
 			// (a report arriving after it would be a genuine second failure).
@@ -201,9 +206,9 @@ func TestFetchOverlappingReportsShareARefreshThatReturnsTheSameToken(t *testing.
 					}
 				}()
 			}
-			<-h.issuer.started
+			waitStarted(t, h.issuer.started)
 			time.Sleep(100 * time.Millisecond)
-			close(h.issuer.release)
+			h.issuer.releaseAll()
 			wg.Wait()
 			if h.issuer.callCount() != 2 {
 				t.Fatalf("issuer calls = %d, want 2 (one refresh for all reports)", h.issuer.callCount())
@@ -212,17 +217,18 @@ func TestFetchOverlappingReportsShareARefreshThatReturnsTheSameToken(t *testing.
 	}
 }
 
-// A peer process that republishes the same approval key (TTL reset) answers a
-// waiting report instead of timing out.
+// A peer process that republishes the same approval key — even in the same
+// instant as the original write — answers a waiting report instead of timing out.
 func TestFetchPeerRepublishOfTheSameValueAnswersAWaitingReport(t *testing.T) {
 	a := newFetchHarness(t, ProviderKISLiveApproval)
 	a.issuer.tokenFn = func(int) string { return sameToken }
 	first := a.fetch("")
-	a.now = a.now.Add(10 * time.Minute)
+	// No clock movement at all: the republish lands in the same instant as the
+	// original write, so only a publication marker can tell the two apart.
 	b := newFetchHarness(t, ProviderKISLiveApproval)
 	b.store.fakeRedisStore = a.store.fakeRedisStore
 	b.issuer = a.issuer
-	b.now = a.now.Add(-10 * time.Minute) // b's clock lags until the republish
+	b.now = a.now
 	b.attach(b.store)
 	b.fetcher.LockWaitTimeout = 5 * time.Second
 	b.fetcher.Now = func() time.Time { return a.now }
@@ -234,7 +240,7 @@ func TestFetchPeerRepublishOfTheSameValueAnswersAWaitingReport(t *testing.T) {
 		_, err := a.fetcher.Fetch(context.Background(), first.SHA256)
 		aDone <- err
 	}()
-	<-a.issuer.started
+	waitStarted(t, a.issuer.started)
 	bResult := make(chan FetchedToken, 1)
 	go func() {
 		got, err := b.fetcher.Fetch(context.Background(), first.SHA256)
@@ -252,7 +258,7 @@ func TestFetchPeerRepublishOfTheSameValueAnswersAWaitingReport(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	close(a.issuer.release)
+	a.issuer.releaseAll()
 	if err := <-aDone; err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +402,7 @@ func TestFetchQueuedReportDoesNotReturnATokenAnExternalWriterReplaced(t *testing
 			t.Errorf("refreshing report: %v", err)
 		}
 	}()
-	<-h.issuer.started
+	waitStarted(t, h.issuer.started)
 	var queued FetchedToken
 	go func() {
 		defer wg.Done()
@@ -407,7 +413,7 @@ func TestFetchQueuedReportDoesNotReturnATokenAnExternalWriterReplaced(t *testing
 		}
 	}()
 	time.Sleep(100 * time.Millisecond) // the second report is now waiting behind the first
-	close(h.issuer.release)
+	h.issuer.releaseAll()
 	wg.Wait()
 	if queued.Token != externalB || queued.Source != FetchSourceRedis {
 		t.Fatalf("queued report returned %s (%v), want the external writer's current token", queued.Source, queued.Token == tokenN(2))

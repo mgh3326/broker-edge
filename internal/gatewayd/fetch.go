@@ -41,6 +41,11 @@ type FetchedToken struct {
 	// does not depend on client-side latency, so two reads of an untouched key
 	// agree and a republish moves it.
 	ServerExpiryMs int64
+	// Publication is the attempt id of a gatewayd publication marker bound to
+	// exactly this record (approval keys); "" for records written by anyone else.
+	Publication string
+	// Raw is the exact stored Redis value, used to compare-and-withdraw it.
+	Raw string
 }
 
 func newFetchedToken(token string, expiresAt time.Time) FetchedToken {
@@ -75,14 +80,11 @@ type ProviderFetchers map[TokenProvider]TokenFetcher
 //
 // gen advances on every change, so a reader that took a Redis snapshot can tell
 // that memory moved while it was reading and must not publish its (possibly
-// older) snapshot over a newer token. issueSeq advances only when an issuance
-// is published, so concurrent failure reports can share a refresh even when the
-// provider handed back the same token bytes.
+// older) snapshot over a newer token.
 type tokenMemory struct {
 	mu           sync.Mutex
 	token        FetchedToken
 	gen          uint64
-	issueSeq     uint64
 	revoked      map[string]struct{}
 	revokedOrder []string
 }
@@ -91,13 +93,13 @@ const maxRevokedHashes = 32
 
 func newTokenMemory() *tokenMemory { return &tokenMemory{} }
 
-func (m *tokenMemory) snapshot() (token FetchedToken, gen, issueSeq uint64) {
+func (m *tokenMemory) snapshot() (token FetchedToken, gen uint64) {
 	if m == nil {
-		return FetchedToken{}, 0, 0
+		return FetchedToken{}, 0
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.token, m.gen, m.issueSeq
+	return m.token, m.gen
 }
 
 // putIssued records a token this process just issued and published to Redis.
@@ -110,7 +112,6 @@ func (m *tokenMemory) putIssued(token FetchedToken) {
 	delete(m.revoked, token.SHA256)
 	m.token = token
 	m.gen++
-	m.issueSeq++
 }
 
 // adopt publishes a token read from Redis, but only if memory did not change
@@ -154,9 +155,9 @@ func (m *tokenMemory) revoke(hashes ...string) {
 		}
 		if m.token.SHA256 == hash {
 			m.token = FetchedToken{}
-			m.gen++
 		}
 	}
+	m.gen++
 	for len(m.revokedOrder) > maxRevokedHashes {
 		delete(m.revoked, m.revokedOrder[0])
 		m.revokedOrder = m.revokedOrder[1:]
@@ -212,105 +213,134 @@ const (
 	fetchAdoptRetries = 4
 	// fetchLeaseMargin keeps the whole lock-owned phase inside the Redis lease.
 	fetchLeaseMargin = 2 * time.Second
-	// publishReserve is lease time kept back for the Redis publish after the
-	// broker call; minIssueWindow is the least broker time worth starting.
-	publishReserve   = 3 * time.Second
-	minIssueWindow   = 4 * time.Second
+	// The lock-owned phase is budgeted backwards from the lease deadline: the
+	// broker call ends publishReserve+reconcileReserve before it, publish
+	// attempts end reconcileReserve before it, and the tail is kept live for
+	// confirming an ambiguous publish. minIssueWindow is the least broker time
+	// worth starting.
 	publishAttempts  = 3
 	publishRetryWait = 50 * time.Millisecond
-	// republishSlack is how much later a same-bytes token's expiry must be to
-	// count as publication evidence by a peer.
-	republishSlack = time.Second
+	// serverExpiryTolerance absorbs the millisecond rounding of two server-side
+	// expiry computations for an untouched record.
+	serverExpiryTolerance = 5 * time.Millisecond
+)
+
+// Lease budget slices (variables only so tests can shrink them).
+var (
+	publishReserve   = 3 * time.Second
+	reconcileReserve = 3 * time.Second
+	minIssueWindow   = 4 * time.Second
 )
 
 var errIssueFailed = errors.New("token issue failed")
 
-// issuancePlan is one lock-owned issuance: how to read the shared record, call
-// the broker, publish, and (if publishing failed) invalidate the shared record.
+// issuedToken is what one broker call produced and how to publish and confirm it.
+type issuedToken struct {
+	token FetchedToken
+	// publish writes the shared record, conditional on still owning the lock.
+	publish func(context.Context) error
+	// committed reports whether a record read back from Redis is this very
+	// publication (used when a publish reply was lost).
+	committed func(FetchedToken) bool
+}
+
+// issuancePlan is one lock-owned issuance.
 type issuancePlan struct {
 	memory    *tokenMemory
 	lock      issuanceLock
 	now       func() time.Time
 	readRedis func(context.Context, time.Time) (FetchedToken, bool, error)
-	issue     func(context.Context) (FetchedToken, func(context.Context) error, error)
-	// invalidate deletes the shared record while the lock is still held.
-	invalidate func(context.Context) error
+	issue     func(context.Context) (issuedToken, error)
+	// singleToken marks providers whose broker invalidates the previous token on
+	// issue (Toss). Their shared predecessor is withdrawn before the broker is
+	// called; withdraw is lock- and record-conditional.
+	singleToken bool
+	withdraw    func(ctx context.Context, expectedRaw string) error
 }
 
 // issueAndPublish is the single issuance path shared by /ensure and /fetch.
 //
 //   - It never contacts the broker unless the lease, measured from before SET
-//     NX, still has room for the broker call plus publication. The broker call is
-//     cut off publishReserve before the lease ends so publication can follow.
-//   - Once it starts, the broker call and the Redis publish run on a context
-//     detached from the caller's cancellation (a disconnecting client cannot
-//     strand a rotated token), bounded by that lease deadline.
-//   - It will not issue if it cannot read the shared record first, because the
-//     replaced token could then not be revoked.
-//   - If the broker rotated the token but Redis could not be updated, the tokens
-//     this replaced are revoked in memory and the shared record is deleted under
-//     the lock, so neither this process, a restart, nor another reader keeps
-//     accepting the invalidated token while Redis is reachable.
+//     NX, still has room for the broker call, publication and reconciliation.
+//   - The broker call is cut off before the publish window, and publish attempts
+//     before the reconcile window, so confirming an ambiguous publish always has
+//     a live context of its own.
+//   - Once it starts, everything runs on a context detached from the caller's
+//     cancellation (a disconnecting client cannot strand a rotated token),
+//     bounded by the lease deadline.
+//   - It will not issue if it cannot read the shared record first.
+//   - For a single-token provider the predecessor is withdrawn from Redis (only
+//     if it still is exactly the snapshot, and only while the lock is held)
+//     before the broker rotates it, and revoked in memory. If anything fails
+//     afterwards, Redis holds a miss, never the invalidated token — also after a
+//     crash or a Redis outage — and the next request reissues.
+//   - A publish whose reply was lost is confirmed by reading the record back;
+//     a committed replacement is never removed or reissued.
 func issueAndPublish(ctx context.Context, plan issuancePlan) (FetchedToken, error) {
-	if ctx.Err() != nil || time.Until(plan.lock.deadline) < minIssueWindow+publishReserve {
+	need := minIssueWindow + publishReserve + reconcileReserve
+	if ctx.Err() != nil || time.Until(plan.lock.deadline) < need {
 		return FetchedToken{}, errIssueFailed
 	}
 	work, cancel := context.WithDeadline(context.WithoutCancel(ctx), plan.lock.deadline)
 	defer cancel()
 
-	var replaced []string
-	if current, _, _ := plan.memory.snapshot(); current.SHA256 != "" {
-		replaced = append(replaced, current.SHA256)
-	}
 	stored, present, err := plan.readRedis(work, plan.now())
-	if err != nil {
+	if err != nil || time.Until(plan.lock.deadline) < need {
 		return FetchedToken{}, errIssueFailed
 	}
-	if present {
-		replaced = append(replaced, stored.SHA256)
+	if plan.singleToken {
+		if present {
+			if err := plan.withdraw(work, stored.Raw); err != nil {
+				return FetchedToken{}, errIssueFailed
+			}
+		}
+		replaced := []string{}
+		if current, _ := plan.memory.snapshot(); current.SHA256 != "" {
+			replaced = append(replaced, current.SHA256)
+		}
+		if present {
+			replaced = append(replaced, stored.SHA256)
+		}
+		plan.memory.revoke(replaced...)
 	}
-	if time.Until(plan.lock.deadline) < minIssueWindow+publishReserve {
-		return FetchedToken{}, errIssueFailed
-	}
-	brokerCtx, cancelBroker := context.WithDeadline(work, plan.lock.deadline.Add(-publishReserve))
-	token, publish, err := plan.issue(brokerCtx)
+	brokerCtx, cancelBroker := context.WithDeadline(work, plan.lock.deadline.Add(-publishReserve-reconcileReserve))
+	issued, err := plan.issue(brokerCtx)
 	cancelBroker()
 	if err != nil {
 		return FetchedToken{}, errIssueFailed
 	}
-	var publishErr error
+	publishCtx, cancelPublish := context.WithDeadline(work, plan.lock.deadline.Add(-reconcileReserve))
+	defer cancelPublish()
+	committed := false
 	for attempt := range publishAttempts {
-		if publishErr = publish(work); publishErr == nil {
+		publishErr := issued.publish(publishCtx)
+		if publishErr == nil {
+			committed = true
 			break
 		}
-		if errors.Is(publishErr, errLockLost) || attempt == publishAttempts-1 || !waitContext(work, publishRetryWait) {
+		if errors.Is(publishErr, errLockLost) {
+			break
+		}
+		// The reply may have been lost after Redis committed: look, on the
+		// reserved reconcile window, before deciding anything.
+		if readBack, found, readErr := plan.readRedis(work, plan.now()); readErr == nil && found && issued.committed(readBack) {
+			committed = true
+			break
+		}
+		if attempt == publishAttempts-1 || !waitContext(publishCtx, publishRetryWait) {
 			break
 		}
 	}
-	if publishErr != nil {
-		kept := replaced[:0]
-		for _, hash := range replaced {
-			if hash != token.SHA256 {
-				kept = append(kept, hash)
-			}
-		}
-		plan.memory.revoke(kept...)
-		if !errors.Is(publishErr, errLockLost) && plan.invalidate != nil {
-			for attempt := range publishAttempts {
-				if plan.invalidate(work) == nil || attempt == publishAttempts-1 || !waitContext(work, publishRetryWait) {
-					break
-				}
-			}
-		}
+	if !committed {
 		return FetchedToken{}, errIssueFailed
 	}
-	plan.memory.putIssued(token)
-	return token, nil
+	plan.memory.putIssued(issued.token)
+	return issued.token, nil
 }
 
 // Fetcher serves one provider's token from memory, Redis or a fresh issue.
-// Issuance is serialised in-process by issueMu and across processes by the same
-// Redis lock /ensure uses.
+// Issuance is serialised in-process by issueSem and across processes by the
+// same Redis lock /ensure uses.
 type Fetcher struct {
 	Store   RedisStore
 	backend fetchBackend
@@ -321,7 +351,9 @@ type Fetcher struct {
 	LockPollEvery   time.Duration
 	LockWaitTimeout time.Duration
 
-	issueMu sync.Mutex
+	// issueSem admits one issuing/refreshing request at a time; acquiring it
+	// honours cancellation, so abandoned requests leave the queue.
+	issueSem chan struct{}
 }
 
 // NewFetcher builds the /fetch capability for this provider. It shares the
@@ -338,6 +370,7 @@ func (service *EnsureService) NewFetcher() *Fetcher {
 		InitialLockWait: service.initialLockWait(),
 		LockPollEvery:   service.lockPollEvery(),
 		LockWaitTimeout: service.lockWaitTimeout(),
+		issueSem:        make(chan struct{}, 1),
 	}
 }
 
@@ -350,6 +383,7 @@ func (s *approvalService) newFetcher() *Fetcher {
 		InitialLockWait: lockInitialWait,
 		LockPollEvery:   lockPollInterval,
 		LockWaitTimeout: lockWaitTimeout,
+		issueSem:        make(chan struct{}, 1),
 	}
 }
 
@@ -360,6 +394,17 @@ func (f *Fetcher) now() time.Time {
 	return f.Now()
 }
 
+func (f *Fetcher) acquire(ctx context.Context) error {
+	select {
+	case f.issueSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return errFetchUnavailable
+	}
+}
+
+func (f *Fetcher) release() { <-f.issueSem }
+
 // Warm loads the provider's token from Redis into memory without ever issuing.
 // It is best effort: a Redis error or an unusable value leaves memory empty and
 // the first Fetch does the same read.
@@ -367,7 +412,7 @@ func (f *Fetcher) Warm(ctx context.Context) {
 	if f == nil || f.backend == nil {
 		return
 	}
-	_, gen, _ := f.memory.snapshot()
+	_, gen := f.memory.snapshot()
 	now := f.now()
 	if token, present, err := f.backend.readRedis(ctx, now); err == nil && present && token.usable(now) {
 		f.memory.adopt(token, gen)
@@ -377,23 +422,35 @@ func (f *Fetcher) Warm(ctx context.Context) {
 // Fetch implements the /fetch contract:
 //   - no failed hash: serve a token with more than 60 s left, else adopt Redis's,
 //     else issue;
-//   - failed hash: resolve it against Redis. A different unexpired token there
-//     is adopted and returned; the same token is reissued once under the lock
-//     (overlapping reports share that refresh); if Redis holds nothing, a
-//     different memory token means the caller was stale.
+//   - failed hash: the report is first bound to the Redis publication it
+//     observed (baseline, read before it queues). It is then resolved against
+//     the shared record: a different unexpired token is adopted and returned; the
+//     same token is reissued once under the lock, unless a newer publication
+//     (proved by the record, not by a local counter) already answers it; if Redis
+//     holds nothing, a different memory token means the caller was stale.
 func (f *Fetcher) Fetch(ctx context.Context, failedSHA256 string) (FetchedToken, error) {
-	if f == nil || f.backend == nil || f.Store == nil {
+	if f == nil || f.backend == nil || f.Store == nil || f.issueSem == nil {
 		return FetchedToken{}, errFetchUnavailable
 	}
-	_, _, entrySeq := f.memory.snapshot()
+	var baseline *FetchedToken
 	if failedSHA256 == "" {
-		if current, _, _ := f.memory.snapshot(); current.usable(f.now()) {
+		if current, _ := f.memory.snapshot(); current.usable(f.now()) {
 			return current.from(FetchSourceMemory), nil
 		}
+	} else {
+		stored, present, err := f.backend.readRedis(ctx, f.now())
+		if err != nil {
+			return FetchedToken{}, errFetchUnavailable
+		}
+		if present {
+			baseline = &stored
+		}
 	}
-	f.issueMu.Lock()
-	defer f.issueMu.Unlock()
-	token, found, observed, err := f.resolveShared(ctx, failedSHA256, entrySeq, nil)
+	if err := f.acquire(ctx); err != nil {
+		return FetchedToken{}, err
+	}
+	defer f.release()
+	token, found, observed, err := f.resolveShared(ctx, failedSHA256, baseline)
 	if err != nil {
 		return FetchedToken{}, err
 	}
@@ -403,18 +460,18 @@ func (f *Fetcher) Fetch(ctx context.Context, failedSHA256 string) (FetchedToken,
 	if failedSHA256 != "" {
 		now := f.now()
 		redisHolds := observed != nil && observed.ExpiresAt.After(now) && !f.memory.isRevoked(observed.SHA256)
-		current, _, _ := f.memory.snapshot()
+		current, _ := f.memory.snapshot()
 		if !redisHolds && current.usable(now) && current.SHA256 != failedSHA256 {
 			return current.from(FetchSourceMemory), nil
 		}
 	}
-	return f.issueUnderLock(ctx, failedSHA256, entrySeq, observed)
+	return f.issueUnderLock(ctx, failedSHA256, baseline)
 }
 
 // acceptable decides whether a token read from Redis answers this request.
 // Ordinary fetches need more than 60 s; a failure report accepts any unexpired
-// token other than the reported one, or the reported one if a peer republished
-// it after baseline was observed.
+// token other than the reported one, or the reported one only if the shared
+// record was published again after the report's baseline.
 func (f *Fetcher) acceptable(token FetchedToken, failedSHA256 string, baseline *FetchedToken, now time.Time) bool {
 	if token.Token == "" || f.memory.isRevoked(token.SHA256) {
 		return false
@@ -428,23 +485,34 @@ func (f *Fetcher) acceptable(token FetchedToken, failedSHA256 string, baseline *
 	if token.SHA256 != failedSHA256 {
 		return true
 	}
-	if baseline == nil {
-		return false
-	}
-	// Same bytes: only a later expiry proves a peer republished. Prefer the
-	// server-side expiry, which client latency cannot move.
-	if token.ServerExpiryMs != 0 && baseline.ServerExpiryMs != 0 {
-		return token.ServerExpiryMs > baseline.ServerExpiryMs+republishSlack.Milliseconds()
-	}
-	return token.ExpiresAt.After(baseline.ExpiresAt.Add(republishSlack))
+	return publishedSince(baseline, token)
 }
 
-// resolveShared answers from state somebody else already produced: memory
-// (after a refresh that overlapped this request) or Redis. found is false when
-// nothing acceptable exists; observed is the Redis token seen, if any.
-func (f *Fetcher) resolveShared(ctx context.Context, failedSHA256 string, entrySeq uint64, baseline *FetchedToken) (token FetchedToken, found bool, observed *FetchedToken, err error) {
+// publishedSince reports whether token (same bytes as baseline's) is a later
+// publication than baseline (nil: none existed). A gatewayd publication carries a unique marker; for
+// anyone else's write only a changed expiry can show it.
+func publishedSince(baseline *FetchedToken, token FetchedToken) bool {
+	if baseline == nil {
+		// The report observed no record at all (for Toss: the predecessor is
+		// withdrawn while a rotation is in flight), so any record present now was
+		// published after it.
+		return true
+	}
+	if token.Publication != "" {
+		return token.Publication != baseline.Publication
+	}
+	if token.ServerExpiryMs != 0 && baseline.ServerExpiryMs != 0 {
+		return token.ServerExpiryMs > baseline.ServerExpiryMs+serverExpiryTolerance.Milliseconds()
+	}
+	return token.ExpiresAt.After(baseline.ExpiresAt)
+}
+
+// resolveShared answers from state somebody else already produced: memory (plain
+// fetches only) or Redis. found is false when nothing acceptable exists;
+// observed is the Redis token seen, if any.
+func (f *Fetcher) resolveShared(ctx context.Context, failedSHA256 string, baseline *FetchedToken) (token FetchedToken, found bool, observed *FetchedToken, err error) {
 	for range fetchAdoptRetries {
-		current, gen, seq := f.memory.snapshot()
+		current, gen := f.memory.snapshot()
 		now := f.now()
 		if current.usable(now) && failedSHA256 == "" {
 			return current.from(FetchSourceMemory), true, observed, nil
@@ -455,14 +523,6 @@ func (f *Fetcher) resolveShared(ctx context.Context, failedSHA256 string, entryS
 		}
 		// Judge remaining lifetime at the end of the read, not before it.
 		now = f.now()
-		// A refresh that completed while this report waited answers it only if the
-		// shared record still is that refresh; an external writer may have
-		// replaced it since.
-		if failedSHA256 != "" && seq != entrySeq && current.usable(now) && present &&
-			stored.SHA256 == current.SHA256 && !f.memory.isRevoked(stored.SHA256) && stored.ExpiresAt.After(now) {
-			copied := stored
-			return current.from(FetchSourceMemory), true, &copied, nil
-		}
 		observed = nil
 		if present {
 			copied := stored
@@ -480,7 +540,7 @@ func (f *Fetcher) resolveShared(ctx context.Context, failedSHA256 string, entryS
 	return FetchedToken{}, false, nil, errFetchUnavailable
 }
 
-func (f *Fetcher) issueUnderLock(ctx context.Context, failedSHA256 string, entrySeq uint64, baseline *FetchedToken) (FetchedToken, error) {
+func (f *Fetcher) issueUnderLock(ctx context.Context, failedSHA256 string, baseline *FetchedToken) (FetchedToken, error) {
 	lock := issuanceLock{key: f.backend.redisLockKey()}
 	value, err := newLockValue()
 	if err != nil {
@@ -493,7 +553,7 @@ func (f *Fetcher) issueUnderLock(ctx context.Context, failedSHA256 string, entry
 		return FetchedToken{}, errFetchUnavailable
 	}
 	if !locked {
-		return f.waitForPeer(ctx, failedSHA256, entrySeq, baseline)
+		return f.waitForPeer(ctx, failedSHA256, baseline)
 	}
 	defer func() {
 		releaseContext, cancel := context.WithTimeout(context.Background(), redisDialTimeout)
@@ -504,7 +564,7 @@ func (f *Fetcher) issueUnderLock(ctx context.Context, failedSHA256 string, entry
 	// owning the lock, before contacting the provider.
 	lock.deadline = leaseDeadline(beforeSetNX, f.backend.redisLockTTL())
 	recheckCtx, cancelRecheck := context.WithDeadline(ctx, lock.deadline)
-	token, found, _, err := f.resolveShared(recheckCtx, failedSHA256, entrySeq, baseline)
+	token, found, _, err := f.resolveShared(recheckCtx, failedSHA256, baseline)
 	cancelRecheck()
 	if err != nil {
 		return FetchedToken{}, err
@@ -521,7 +581,7 @@ func (f *Fetcher) issueUnderLock(ctx context.Context, failedSHA256 string, entry
 
 // waitForPeer polls for the lock holder's publication. There is no fallback to
 // issuing without the lock: a timeout is errFetchUnavailable.
-func (f *Fetcher) waitForPeer(ctx context.Context, failedSHA256 string, entrySeq uint64, baseline *FetchedToken) (FetchedToken, error) {
+func (f *Fetcher) waitForPeer(ctx context.Context, failedSHA256 string, baseline *FetchedToken) (FetchedToken, error) {
 	poll := f.LockPollEvery
 	if poll <= 0 {
 		poll = lockPollInterval
@@ -538,7 +598,7 @@ func (f *Fetcher) waitForPeer(ctx context.Context, failedSHA256 string, entrySeq
 		attempts = 1
 	}
 	for range attempts {
-		token, found, _, err := f.resolveShared(ctx, failedSHA256, entrySeq, baseline)
+		token, found, _, err := f.resolveShared(ctx, failedSHA256, baseline)
 		if err != nil {
 			return FetchedToken{}, err
 		}
@@ -569,7 +629,9 @@ func (service *EnsureService) readRedis(ctx context.Context, _ time.Time) (Fetch
 	if !valid {
 		return FetchedToken{}, false, nil
 	}
-	return newFetchedToken(token, expiresAt), true, nil
+	fetched := newFetchedToken(token, expiresAt)
+	fetched.Raw = raw
+	return fetched, true, nil
 }
 
 // parseCachedTokenPayload applies the same strict shapes the Python writers and
@@ -618,7 +680,7 @@ func (s *approvalService) redisLockTTL() time.Duration { return approvalLockTTL 
 // that TTL because the Redis value carries no timestamp. Two separate reads
 // could pair one key with the fresh TTL of its replacement.
 func (s *approvalService) readRedis(ctx context.Context, now time.Time) (FetchedToken, bool, error) {
-	raw, ttl, serverExpiryMs, present, err := s.store.GetWithTTL(ctx, s.cacheKey)
+	raw, ttl, serverExpiryMs, publication, present, err := s.store.GetWithTTL(ctx, s.cacheKey)
 	if err != nil {
 		return FetchedToken{}, false, errFetchUnavailable
 	}
@@ -627,5 +689,7 @@ func (s *approvalService) readRedis(ctx context.Context, now time.Time) (Fetched
 	}
 	token := newFetchedToken(raw, now.Add(ttl))
 	token.ServerExpiryMs = serverExpiryMs
+	token.Publication = publication
+	token.Raw = raw
 	return token, true, nil
 }

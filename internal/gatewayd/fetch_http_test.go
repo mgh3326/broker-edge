@@ -1,6 +1,7 @@
 package gatewayd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -313,5 +315,39 @@ func TestFetchMetricsAreBoundedByProviderOutcomeAndSource(t *testing.T) {
 	}
 	if strings.Contains(text, "attacker-controlled") {
 		t.Fatal("request-controlled text became a label")
+	}
+}
+
+// A client that sends complete headers and then withholds the body must be cut
+// off by the read deadline instead of holding the handler open.
+func TestFetchHTTPStalledBodyIsCutOffByTheReadDeadline(t *testing.T) {
+	previous := fetchBodyReadTimeout
+	fetchBodyReadTimeout = 200 * time.Millisecond
+	defer func() { fetchBodyReadTimeout = previous }()
+
+	server := newFetchServer(t, consumersJSON(t), ProviderToss)
+	httpServer := httptest.NewServer(server.handler)
+	defer httpServer.Close()
+	connection, err := net.Dial("tcp", httpServer.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+	request := "POST /v1/tokens/toss/fetch HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + credentialFillwire +
+		"\r\nContent-Length: 40\r\n\r\n{\"failed_"
+	if _, err := connection.Write([]byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	status, err := bufio.NewReader(connection).ReadString('\n')
+	if err != nil {
+		t.Fatalf("no response to a stalled body: %v", err)
+	}
+	if !strings.Contains(status, "400") || time.Since(started) > 3*time.Second {
+		t.Fatalf("status %q after %v", strings.TrimSpace(status), time.Since(started))
+	}
+	if server.h[ProviderToss].issuer.callCount() != 0 {
+		t.Fatal("a stalled request reached the broker")
 	}
 }

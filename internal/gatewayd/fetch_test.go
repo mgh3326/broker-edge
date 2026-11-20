@@ -57,7 +57,7 @@ func (store *countingStore) TTL(ctx context.Context, key string) (time.Duration,
 	return store.fakeRedisStore.TTL(ctx, key)
 }
 
-func (store *countingStore) GetWithTTL(ctx context.Context, key string) (string, time.Duration, int64, bool, error) {
+func (store *countingStore) GetWithTTL(ctx context.Context, key string) (string, time.Duration, int64, string, bool, error) {
 	store.reads.Add(1)
 	store.hookMu.Lock()
 	hook := store.getWithTTLHook
@@ -71,8 +71,8 @@ func (store *countingStore) GetWithTTL(ctx context.Context, key string) (string,
 
 // SetIfLockHeld runs afterSetHook (once) after a successful publish, before the
 // caller learns of it: it models an external writer publishing right after.
-func (store *countingStore) SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error {
-	err := store.fakeRedisStore.SetIfLockHeld(ctx, lockKey, lockValue, key, value, ttl)
+func (store *countingStore) SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration, publication string) error {
+	err := store.fakeRedisStore.SetIfLockHeld(ctx, lockKey, lockValue, key, value, ttl, publication)
 	store.hookMu.Lock()
 	hook := store.afterSetHook
 	if err == nil {
@@ -101,6 +101,9 @@ type seqIssuer struct {
 	release chan struct{}
 	err     error
 	tokenFn func(n int) string
+	// onIssue runs inside Issue (e.g. to let a fake clock advance).
+	onIssue  func()
+	gateOnce sync.Once
 	// deadline is the deadline of the context the last Issue call received.
 	deadline time.Time
 }
@@ -109,7 +112,7 @@ func (issuer *seqIssuer) Issue(ctx context.Context, _, _ string) (OAuthToken, er
 	issuer.mu.Lock()
 	issuer.calls++
 	n := issuer.calls
-	started, release, err, tokenFn := issuer.started, issuer.release, issuer.err, issuer.tokenFn
+	started, release, err, tokenFn, onIssue := issuer.started, issuer.release, issuer.err, issuer.tokenFn, issuer.onIssue
 	issuer.deadline, _ = ctx.Deadline()
 	issuer.mu.Unlock()
 	if started != nil {
@@ -125,6 +128,9 @@ func (issuer *seqIssuer) Issue(ctx context.Context, _, _ string) (OAuthToken, er
 			return OAuthToken{}, ctx.Err()
 		}
 	}
+	if onIssue != nil {
+		onIssue()
+	}
 	if err != nil {
 		return OAuthToken{}, err
 	}
@@ -133,6 +139,28 @@ func (issuer *seqIssuer) Issue(ctx context.Context, _, _ string) (OAuthToken, er
 		token = tokenFn(n)
 	}
 	return OAuthToken{AccessToken: token, ExpiresIn: 3600}, nil
+}
+
+// releaseAll opens the gate for every blocked and future Issue call, once.
+func (issuer *seqIssuer) releaseAll() {
+	issuer.gateOnce.Do(func() {
+		issuer.mu.Lock()
+		release := issuer.release
+		issuer.mu.Unlock()
+		if release != nil {
+			close(release)
+		}
+	})
+}
+
+// waitStarted waits (bounded) for an Issue call to begin.
+func waitStarted(t *testing.T, started <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the broker was never called")
+	}
 }
 
 func (issuer *seqIssuer) callCount() int {
@@ -167,6 +195,7 @@ func newFetchHarness(t *testing.T, provider TokenProvider) *fetchHarness {
 	clock := func() time.Time { return h.now }
 	h.store = &countingStore{fakeRedisStore: newFakeRedisStore(clock)}
 	h.attach(h.store)
+	t.Cleanup(func() { h.issuer.releaseAll() })
 	return h
 }
 
@@ -410,8 +439,8 @@ func TestFetchConcurrentFetchesIssueOnce(t *testing.T) {
 			results <- token
 		}()
 	}
-	<-h.issuer.started
-	close(h.issuer.release)
+	waitStarted(t, h.issuer.started)
+	h.issuer.releaseAll()
 	wg.Wait()
 	close(results)
 	issued := 0
@@ -463,7 +492,7 @@ func TestFetchAcrossProcessesIssuesOnceUnderRedisLock(t *testing.T) {
 		token, _ := a.fetcher.Fetch(context.Background(), "")
 		firstDone <- token
 	}()
-	<-a.issuer.started
+	waitStarted(t, a.issuer.started)
 	secondDone := make(chan FetchedToken, 1)
 	go func() {
 		token, _ := b.fetcher.Fetch(context.Background(), "")
@@ -479,7 +508,7 @@ func TestFetchAcrossProcessesIssuesOnceUnderRedisLock(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	close(a.issuer.release)
+	a.issuer.releaseAll()
 	first, second := <-firstDone, <-secondDone
 	if first.Source != FetchSourceIssued || second.Source != FetchSourceRedis || first.Token != second.Token {
 		t.Fatalf("sources %s/%s", first.Source, second.Source)
@@ -502,17 +531,34 @@ func TestFetchContendedLockWithoutPublishIsUnavailableAndNeverIssues(t *testing.
 	}
 }
 
-func TestFetchIssueFailureIsUnavailableAndLeavesMemoryAlone(t *testing.T) {
-	h := newFetchHarness(t, ProviderToss)
-	first := h.fetch("")
-	h.issuer.err = fmt.Errorf("broker said %s", first.Token)
-	if _, err := h.fetcher.Fetch(context.Background(), first.SHA256); err != errFetchUnavailable {
-		t.Fatalf("err = %v", err)
-	}
-	h.issuer.err = nil
-	if got := h.fetch(""); got.Source != FetchSourceMemory || got.Token != first.Token {
-		t.Fatalf("memory after failed reissue = %s", got.Source)
-	}
+func TestFetchIssueFailureIsUnavailable(t *testing.T) {
+	t.Run("kis-mock keeps its still-valid token", func(t *testing.T) {
+		h := newFetchHarness(t, ProviderKISMock)
+		first := h.fetch("")
+		h.issuer.err = fmt.Errorf("broker said %s", first.Token)
+		if _, err := h.fetcher.Fetch(context.Background(), first.SHA256); err != errFetchUnavailable {
+			t.Fatalf("err = %v", err)
+		}
+		h.issuer.err = nil
+		if got := h.fetch(""); got.Source != FetchSourceMemory || got.Token != first.Token {
+			t.Fatalf("memory after failed reissue = %s", got.Source)
+		}
+	})
+	t.Run("toss was withdrawn before the call, so the next request reissues", func(t *testing.T) {
+		h := newFetchHarness(t, ProviderToss)
+		first := h.fetch("")
+		h.issuer.err = fmt.Errorf("broker said %s", first.Token)
+		if _, err := h.fetcher.Fetch(context.Background(), first.SHA256); err != errFetchUnavailable {
+			t.Fatalf("err = %v", err)
+		}
+		if _, present, _ := h.store.Get(context.Background(), h.cacheKey); present {
+			t.Fatal("the shared predecessor was left readable across the broker call")
+		}
+		h.issuer.err = nil
+		if got := h.fetch(""); got.Source != FetchSourceIssued || got.Token == first.Token {
+			t.Fatalf("after a failed rotation: %s", got.Source)
+		}
+	})
 }
 
 func TestFetchRedisReadErrorIsUnavailable(t *testing.T) {

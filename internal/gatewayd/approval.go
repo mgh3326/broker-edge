@@ -23,8 +23,9 @@ type approvalStore interface {
 	// PTTL answers presence and freshness atomically.
 	TTL(ctx context.Context, key string) (time.Duration, error)
 	// GetWithTTL reads the value and its remaining lifetime atomically.
-	// serverExpiryMs is the absolute expiry on the Redis server clock.
-	GetWithTTL(ctx context.Context, key string) (value string, ttl time.Duration, serverExpiryMs int64, present bool, err error)
+	// serverExpiryMs is the absolute expiry on the Redis server clock;
+	// publication is the attempt id of a marker bound to exactly this record.
+	GetWithTTL(ctx context.Context, key string) (value string, ttl time.Duration, serverExpiryMs int64, publication string, present bool, err error)
 	// Held reports whether key exists, used to observe the issuance lock.
 	Held(ctx context.Context, key string) (bool, error)
 }
@@ -144,7 +145,9 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 	// A publish may have landed between the last Held() observation and our
 	// SetNX (or between the first sample and a direct acquire); skip issuance
 	// when the TTL moved up in that gap.
-	ttl, err := s.cachedTTL(ctx)
+	recheckContext, cancelRecheck := context.WithDeadline(ctx, leaseDeadline(beforeSetNX, approvalLockTTL))
+	ttl, err := s.cachedTTL(recheckContext)
+	cancelRecheck()
 	if err != nil {
 		return "", err
 	}
@@ -158,22 +161,29 @@ func (s *approvalService) ensure(ctx context.Context, force bool) (EnsureState, 
 }
 
 // issueAndStore performs one approval-key issue and writes Redis (raw key,
-// 23 h TTL) exactly as /ensure does. The caller owns lock; publication is
-// conditional on still holding it and bounded by its lease.
+// 23 h TTL) exactly as /ensure does, plus a publication marker in a sibling key.
+// The caller owns lock; see issueAndPublish. The predecessor stays visible until
+// replaced (an approval key's replacement does not invalidate it).
 func (s *approvalService) issueAndStore(ctx context.Context, lock issuanceLock) (FetchedToken, error) {
 	return issueAndPublish(ctx, issuancePlan{
 		memory: s.memory, lock: lock, now: s.now, readRedis: s.readRedis,
-		invalidate: func(c context.Context) error {
-			return s.store.DeleteIfLockHeld(c, lock.key, lock.value, s.cacheKey)
-		},
-		issue: func(work context.Context) (FetchedToken, func(context.Context) error, error) {
+		issue: func(work context.Context) (issuedToken, error) {
 			issued, err := s.issuer.Issue(work, s.config.AppKey, s.config.AppSecret)
 			if err != nil || strings.TrimSpace(issued.AccessToken) == "" {
-				return FetchedToken{}, nil, errEnsureUnavailable
+				return issuedToken{}, errEnsureUnavailable
+			}
+			attempt, err := newLockValue()
+			if err != nil {
+				return issuedToken{}, errEnsureUnavailable
 			}
 			token := newFetchedToken(issued.AccessToken, s.now().Add(approvalTTL))
-			return token, func(c context.Context) error {
-				return s.store.SetIfLockHeld(c, lock.key, lock.value, s.cacheKey, issued.AccessToken, approvalTTL)
+			token.Raw, token.Publication = issued.AccessToken, attempt
+			return issuedToken{
+				token: token,
+				publish: func(c context.Context) error {
+					return s.store.SetIfLockHeld(c, lock.key, lock.value, s.cacheKey, issued.AccessToken, approvalTTL, attempt)
+				},
+				committed: func(stored FetchedToken) bool { return stored.Publication == attempt && stored.SHA256 == token.SHA256 },
 			}, nil
 		},
 	})

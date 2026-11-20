@@ -24,7 +24,19 @@ var (
 	// errLockLost reports that a lock-conditional write found the lock gone or
 	// owned by someone else.
 	errLockLost = errors.New("redis lock lost")
+	// errStateChanged reports that a state-conditional write found the record
+	// different from the one the caller meant to replace or remove.
+	errStateChanged = errors.New("redis record changed")
 )
+
+// publicationKey is the sibling key holding the publication marker of the
+// record at key. Legacy readers never look at it.
+func publicationKey(key string) string { return key + ":gatewayd:publication" }
+
+// markerTolerance is how far a marker's recorded expiry may differ from the
+// record's current server-side expiry and still count as describing it. A
+// different writer replaces the record and moves the expiry by far more.
+const markerTolerance = 50 * time.Millisecond
 
 // RedisStore is the narrow capability set required by the issuer. The
 // read-only KIS paths retain their separate GET-only client.
@@ -35,10 +47,14 @@ type RedisStore interface {
 	CompareAndDelete(ctx context.Context, key, value string) error
 	// SetIfLockHeld stores key=value with an EX TTL only while lockKey still
 	// holds lockValue, so an issuer whose lease expired cannot overwrite a
-	// successor's publication. It returns errLockLost when the lock is not held.
-	SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error
-	// DeleteIfLockHeld removes key only while lockKey still holds lockValue.
-	DeleteIfLockHeld(ctx context.Context, lockKey, lockValue, key string) error
+	// successor's publication. A non-empty publication is recorded, in the same
+	// atomic step, as a marker bound to the new record and its expiry; it lets a
+	// reader tell this publication from a later one with identical bytes. It
+	// returns errLockLost when the lock is not held.
+	SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration, publication string) error
+	// WithdrawIfLockHeld deletes key only while lockKey holds lockValue and key
+	// still holds expected. errLockLost / errStateChanged report which check failed.
+	WithdrawIfLockHeld(ctx context.Context, lockKey, lockValue, key, expected string) error
 }
 
 // RedisClient is a small RESP client for the issuer's GET, SET, SET NX EX,
@@ -166,14 +182,21 @@ func (client *RedisClient) CompareAndDelete(ctx context.Context, key, value stri
 	return nil
 }
 
-// SetIfLockHeld is SET ... EX guarded by lock ownership in one Lua call.
-func (client *RedisClient) SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error {
+// SetIfLockHeld is SET ... EX guarded by lock ownership in one Lua call, with
+// an optional publication marker written in the same step.
+func (client *RedisClient) SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration, publication string) error {
 	seconds, valid := redisTTLSeconds(ttl)
-	if !valid {
+	if !valid || strings.ContainsAny(publication, ":@") {
 		return errRedisUnavailable
 	}
-	const script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3]) else return false end"
-	reply, err := client.execute(ctx, "EVAL", script, "2", lockKey, key, lockValue, value, seconds)
+	const script = "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return false end; " +
+		"redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3]); " +
+		"if ARGV[4] ~= '' then " +
+		"local t = redis.call('TIME'); local nowms = t[1] * 1000 + math.floor(t[2] / 1000); " +
+		"redis.call('SET', KEYS[3], ARGV[4] .. '@' .. (nowms + ARGV[3] * 1000), 'EX', ARGV[3]) " +
+		"else redis.call('DEL', KEYS[3]) end; " +
+		"return redis.status_reply('OK')"
+	reply, err := client.execute(ctx, "EVAL", script, "3", lockKey, key, publicationKey(key), lockValue, value, seconds, publication)
 	if err != nil {
 		return errRedisUnavailable
 	}
@@ -186,12 +209,13 @@ func (client *RedisClient) SetIfLockHeld(ctx context.Context, lockKey, lockValue
 	return nil
 }
 
-// DeleteIfLockHeld is DEL guarded by lock ownership in one Lua call. It is how
-// an issuer withdraws a record it knows the broker has invalidated, without
-// touching a successor's record.
-func (client *RedisClient) DeleteIfLockHeld(ctx context.Context, lockKey, lockValue, key string) error {
-	const script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[2]) else return false end"
-	reply, err := client.execute(ctx, "EVAL", script, "2", lockKey, key, lockValue)
+// WithdrawIfLockHeld is DEL guarded by lock ownership and by the exact record
+// the caller means to remove, in one Lua call.
+func (client *RedisClient) WithdrawIfLockHeld(ctx context.Context, lockKey, lockValue, key, expected string) error {
+	const script = "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return false end; " +
+		"if redis.call('GET', KEYS[2]) ~= ARGV[2] then return -1 end; " +
+		"redis.call('DEL', KEYS[3]); return redis.call('DEL', KEYS[2])"
+	reply, err := client.execute(ctx, "EVAL", script, "3", lockKey, key, publicationKey(key), lockValue, expected)
 	if err != nil {
 		return errRedisUnavailable
 	}
@@ -201,36 +225,64 @@ func (client *RedisClient) DeleteIfLockHeld(ctx context.Context, lockKey, lockVa
 	if reply.kind != ':' {
 		return errRedisUnavailable
 	}
+	if reply.text == "-1" {
+		return errStateChanged
+	}
 	return nil
 }
 
-// GetWithTTL reads a value, its remaining lifetime and its absolute expiry on
-// the server clock in one atomic call. A missing key is present=false; a key
-// without expiry reports a non-positive ttl.
-func (client *RedisClient) GetWithTTL(ctx context.Context, key string) (string, time.Duration, int64, bool, error) {
+// GetWithTTL reads a value, its remaining lifetime, its absolute expiry on the
+// server clock and the publication marker bound to it, in one atomic call. A
+// missing key is present=false; a key without expiry reports a non-positive
+// ttl; publication is "" unless a marker describes exactly this record.
+func (client *RedisClient) GetWithTTL(ctx context.Context, key string) (string, time.Duration, int64, string, bool, error) {
 	const script = "local v = redis.call('GET', KEYS[1]); if not v then return false end; " +
 		"local t = redis.call('TIME'); local nowms = t[1] * 1000 + math.floor(t[2] / 1000); " +
-		"local ttl = redis.call('PTTL', KEYS[1]); return (nowms + ttl) .. ':' .. ttl .. ':' .. v"
-	reply, err := client.execute(ctx, "EVAL", script, "1", key)
+		"local ttl = redis.call('PTTL', KEYS[1]); " +
+		"local m = redis.call('GET', KEYS[2]); if not m then m = '' end; " +
+		"return (nowms + ttl) .. ':' .. ttl .. ':' .. m .. ':' .. v"
+	reply, err := client.execute(ctx, "EVAL", script, "2", key, publicationKey(key))
 	if err != nil {
-		return "", 0, 0, false, errRedisUnavailable
+		return "", 0, 0, "", false, errRedisUnavailable
 	}
 	if reply.nilValue {
-		return "", 0, 0, false, nil
+		return "", 0, 0, "", false, nil
 	}
 	if reply.kind != '$' {
-		return "", 0, 0, false, errRedisUnavailable
+		return "", 0, 0, "", false, errRedisUnavailable
 	}
-	parts := strings.SplitN(reply.text, ":", 3)
-	if len(parts) != 3 {
-		return "", 0, 0, false, errRedisUnavailable
+	parts := strings.SplitN(reply.text, ":", 4)
+	if len(parts) != 4 {
+		return "", 0, 0, "", false, errRedisUnavailable
 	}
 	absolute, absErr := strconv.ParseInt(parts[0], 10, 64)
 	ms, ttlErr := strconv.ParseInt(parts[1], 10, 64)
 	if absErr != nil || ttlErr != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) {
-		return "", 0, 0, false, errRedisUnavailable
+		return "", 0, 0, "", false, errRedisUnavailable
 	}
-	return parts[2], time.Duration(ms) * time.Millisecond, absolute, true, nil
+	return parts[3], time.Duration(ms) * time.Millisecond, absolute, boundPublication(parts[2], absolute), true, nil
+}
+
+// boundPublication returns the attempt id of a "<attempt>@<expiry-ms>" marker
+// if, and only if, its recorded expiry matches the record's current expiry. A
+// later write by anyone else moves the expiry, so it cannot inherit the marker.
+func boundPublication(marker string, serverExpiryMs int64) string {
+	attempt, expiry, found := strings.Cut(marker, "@")
+	if !found || attempt == "" {
+		return ""
+	}
+	recorded, err := strconv.ParseInt(expiry, 10, 64)
+	if err != nil {
+		return ""
+	}
+	delta := recorded - serverExpiryMs
+	if delta < 0 {
+		delta = -delta
+	}
+	if time.Duration(delta)*time.Millisecond > markerTolerance {
+		return ""
+	}
+	return attempt
 }
 
 // Held reports whether key exists; the approval lock-wait loop uses it to
@@ -324,7 +376,7 @@ func setRedisDeadline(connection net.Conn, ctx context.Context) error {
 }
 
 func writeRESPArray(writer *bufio.Writer, values ...string) error {
-	if len(values) == 0 || len(values) > 8 {
+	if len(values) == 0 || len(values) > 12 {
 		return errors.New("invalid redis command")
 	}
 	if _, err := fmt.Fprintf(writer, "*%d\r\n", len(values)); err != nil {

@@ -12,6 +12,11 @@ import (
 
 const fetchBodyLimit = 4096
 
+// fetchBodyReadTimeout bounds how long a client may take to send the request
+// body; http.Server's header and idle timeouts do not cover a stalled body.
+// (A variable only so a test can shorten it.)
+var fetchBodyReadTimeout = 5 * time.Second
+
 // FetchOptions wires the /fetch route. The zero value answers 401 to everyone:
 // with no consumer configured the route is off.
 type FetchOptions struct {
@@ -38,6 +43,7 @@ type fetchResponse struct {
 func fetchHandler(options FetchOptions, logger EventLogger, metrics *Metrics) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		provider := TokenProvider(request.PathValue("provider"))
+		_ = http.NewResponseController(writer).SetReadDeadline(time.Now().Add(fetchBodyReadTimeout))
 		fail := func(status int, code string, message string) {
 			logEvent(logger, message)
 			metrics.recordFetch(provider, code, "")
