@@ -37,6 +37,8 @@ type RedisStore interface {
 	// holds lockValue, so an issuer whose lease expired cannot overwrite a
 	// successor's publication. It returns errLockLost when the lock is not held.
 	SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error
+	// DeleteIfLockHeld removes key only while lockKey still holds lockValue.
+	DeleteIfLockHeld(ctx context.Context, lockKey, lockValue, key string) error
 }
 
 // RedisClient is a small RESP client for the issuer's GET, SET, SET NX EX,
@@ -184,26 +186,51 @@ func (client *RedisClient) SetIfLockHeld(ctx context.Context, lockKey, lockValue
 	return nil
 }
 
-// GetWithTTL reads a value and its remaining lifetime atomically. A missing key
-// is present=false; a key without expiry reports a non-positive ttl.
-func (client *RedisClient) GetWithTTL(ctx context.Context, key string) (string, time.Duration, bool, error) {
-	const script = "local v = redis.call('GET', KEYS[1]); if not v then return false end; return redis.call('PTTL', KEYS[1]) .. ':' .. v"
-	reply, err := client.execute(ctx, "EVAL", script, "1", key)
+// DeleteIfLockHeld is DEL guarded by lock ownership in one Lua call. It is how
+// an issuer withdraws a record it knows the broker has invalidated, without
+// touching a successor's record.
+func (client *RedisClient) DeleteIfLockHeld(ctx context.Context, lockKey, lockValue, key string) error {
+	const script = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[2]) else return false end"
+	reply, err := client.execute(ctx, "EVAL", script, "2", lockKey, key, lockValue)
 	if err != nil {
-		return "", 0, false, errRedisUnavailable
+		return errRedisUnavailable
 	}
 	if reply.nilValue {
-		return "", 0, false, nil
+		return errLockLost
+	}
+	if reply.kind != ':' {
+		return errRedisUnavailable
+	}
+	return nil
+}
+
+// GetWithTTL reads a value, its remaining lifetime and its absolute expiry on
+// the server clock in one atomic call. A missing key is present=false; a key
+// without expiry reports a non-positive ttl.
+func (client *RedisClient) GetWithTTL(ctx context.Context, key string) (string, time.Duration, int64, bool, error) {
+	const script = "local v = redis.call('GET', KEYS[1]); if not v then return false end; " +
+		"local t = redis.call('TIME'); local nowms = t[1] * 1000 + math.floor(t[2] / 1000); " +
+		"local ttl = redis.call('PTTL', KEYS[1]); return (nowms + ttl) .. ':' .. ttl .. ':' .. v"
+	reply, err := client.execute(ctx, "EVAL", script, "1", key)
+	if err != nil {
+		return "", 0, 0, false, errRedisUnavailable
+	}
+	if reply.nilValue {
+		return "", 0, 0, false, nil
 	}
 	if reply.kind != '$' {
-		return "", 0, false, errRedisUnavailable
+		return "", 0, 0, false, errRedisUnavailable
 	}
-	millis, value, found := strings.Cut(reply.text, ":")
-	ms, parseErr := strconv.ParseInt(millis, 10, 64)
-	if !found || parseErr != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) {
-		return "", 0, false, errRedisUnavailable
+	parts := strings.SplitN(reply.text, ":", 3)
+	if len(parts) != 3 {
+		return "", 0, 0, false, errRedisUnavailable
 	}
-	return value, time.Duration(ms) * time.Millisecond, true, nil
+	absolute, absErr := strconv.ParseInt(parts[0], 10, 64)
+	ms, ttlErr := strconv.ParseInt(parts[1], 10, 64)
+	if absErr != nil || ttlErr != nil || ms > int64((1<<63-1)/int64(time.Millisecond)) {
+		return "", 0, 0, false, errRedisUnavailable
+	}
+	return parts[2], time.Duration(ms) * time.Millisecond, absolute, true, nil
 }
 
 // Held reports whether key exists; the approval lock-wait loop uses it to

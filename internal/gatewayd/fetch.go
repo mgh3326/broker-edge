@@ -36,6 +36,11 @@ type FetchedToken struct {
 	ExpiresAt time.Time
 	SHA256    string
 	Source    FetchSource
+	// ServerExpiryMs is the key's absolute expiry on the Redis server clock, set
+	// only for values that carry no timestamp of their own (approval keys). It
+	// does not depend on client-side latency, so two reads of an untouched key
+	// agree and a republish moves it.
+	ServerExpiryMs int64
 }
 
 func newFetchedToken(token string, expiresAt time.Time) FetchedToken {
@@ -168,8 +173,24 @@ func (m *tokenMemory) isRevoked(hash string) bool {
 	return revoked
 }
 
-// issuanceLock names the Redis lock the caller owns while it issues.
-type issuanceLock struct{ key, value string }
+// issuanceLock names the Redis lock the caller owns while it issues. deadline is
+// the conservative absolute end of the lease, measured from before SET NX was
+// sent, minus fetchLeaseMargin: nothing lock-owned may be started, or still be
+// running, past it.
+type issuanceLock struct {
+	key, value string
+	deadline   time.Time
+}
+
+// leaseDeadline is taken by the caller *before* sending SET NX, so network
+// latency to Redis can only shorten the window it believes it has.
+func leaseDeadline(beforeSetNX time.Time, lease time.Duration) time.Time {
+	margin := fetchLeaseMargin
+	if lease <= 2*margin {
+		margin = lease / 4
+	}
+	return beforeSetNX.Add(lease - margin)
+}
 
 // fetchBackend is the provider-specific half of a Fetcher: how the existing
 // Redis key is read and how the existing issuance path writes it.
@@ -191,6 +212,10 @@ const (
 	fetchAdoptRetries = 4
 	// fetchLeaseMargin keeps the whole lock-owned phase inside the Redis lease.
 	fetchLeaseMargin = 2 * time.Second
+	// publishReserve is lease time kept back for the Redis publish after the
+	// broker call; minIssueWindow is the least broker time worth starting.
+	publishReserve   = 3 * time.Second
+	minIssueWindow   = 4 * time.Second
 	publishAttempts  = 3
 	publishRetryWait = 50 * time.Millisecond
 	// republishSlack is how much later a same-bytes token's expiry must be to
@@ -200,41 +225,56 @@ const (
 
 var errIssueFailed = errors.New("token issue failed")
 
+// issuancePlan is one lock-owned issuance: how to read the shared record, call
+// the broker, publish, and (if publishing failed) invalidate the shared record.
+type issuancePlan struct {
+	memory    *tokenMemory
+	lock      issuanceLock
+	now       func() time.Time
+	readRedis func(context.Context, time.Time) (FetchedToken, bool, error)
+	issue     func(context.Context) (FetchedToken, func(context.Context) error, error)
+	// invalidate deletes the shared record while the lock is still held.
+	invalidate func(context.Context) error
+}
+
 // issueAndPublish is the single issuance path shared by /ensure and /fetch.
 //
+//   - It never contacts the broker unless the lease, measured from before SET
+//     NX, still has room for the broker call plus publication. The broker call is
+//     cut off publishReserve before the lease ends so publication can follow.
 //   - Once it starts, the broker call and the Redis publish run on a context
 //     detached from the caller's cancellation (a disconnecting client cannot
-//     strand a rotated token) but bounded by the lock lease, so nothing is
-//     published after another holder may have taken the lock over.
+//     strand a rotated token), bounded by that lease deadline.
+//   - It will not issue if it cannot read the shared record first, because the
+//     replaced token could then not be revoked.
 //   - If the broker rotated the token but Redis could not be updated, the tokens
-//     this replaced are revoked, so neither memory nor Redis can hand out the
-//     now-invalid one; the next request reissues under the lock.
-func issueAndPublish(
-	ctx context.Context,
-	memory *tokenMemory,
-	lease time.Duration,
-	now func() time.Time,
-	readRedis func(context.Context, time.Time) (FetchedToken, bool, error),
-	issue func(context.Context) (FetchedToken, func(context.Context) error, error),
-) (FetchedToken, error) {
-	if ctx.Err() != nil {
+//     this replaced are revoked in memory and the shared record is deleted under
+//     the lock, so neither this process, a restart, nor another reader keeps
+//     accepting the invalidated token while Redis is reachable.
+func issueAndPublish(ctx context.Context, plan issuancePlan) (FetchedToken, error) {
+	if ctx.Err() != nil || time.Until(plan.lock.deadline) < minIssueWindow+publishReserve {
 		return FetchedToken{}, errIssueFailed
 	}
-	budget := lease - fetchLeaseMargin
-	if budget <= 0 {
-		budget = lease / 2
-	}
-	work, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
+	work, cancel := context.WithDeadline(context.WithoutCancel(ctx), plan.lock.deadline)
 	defer cancel()
 
 	var replaced []string
-	if current, _, _ := memory.snapshot(); current.SHA256 != "" {
+	if current, _, _ := plan.memory.snapshot(); current.SHA256 != "" {
 		replaced = append(replaced, current.SHA256)
 	}
-	if stored, present, err := readRedis(work, now()); err == nil && present {
+	stored, present, err := plan.readRedis(work, plan.now())
+	if err != nil {
+		return FetchedToken{}, errIssueFailed
+	}
+	if present {
 		replaced = append(replaced, stored.SHA256)
 	}
-	token, publish, err := issue(work)
+	if time.Until(plan.lock.deadline) < minIssueWindow+publishReserve {
+		return FetchedToken{}, errIssueFailed
+	}
+	brokerCtx, cancelBroker := context.WithDeadline(work, plan.lock.deadline.Add(-publishReserve))
+	token, publish, err := plan.issue(brokerCtx)
+	cancelBroker()
 	if err != nil {
 		return FetchedToken{}, errIssueFailed
 	}
@@ -254,10 +294,17 @@ func issueAndPublish(
 				kept = append(kept, hash)
 			}
 		}
-		memory.revoke(kept...)
+		plan.memory.revoke(kept...)
+		if !errors.Is(publishErr, errLockLost) && plan.invalidate != nil {
+			for attempt := range publishAttempts {
+				if plan.invalidate(work) == nil || attempt == publishAttempts-1 || !waitContext(work, publishRetryWait) {
+					break
+				}
+			}
+		}
 		return FetchedToken{}, errIssueFailed
 	}
-	memory.putIssued(token)
+	plan.memory.putIssued(token)
 	return token, nil
 }
 
@@ -381,7 +428,15 @@ func (f *Fetcher) acceptable(token FetchedToken, failedSHA256 string, baseline *
 	if token.SHA256 != failedSHA256 {
 		return true
 	}
-	return baseline != nil && token.ExpiresAt.After(baseline.ExpiresAt.Add(republishSlack))
+	if baseline == nil {
+		return false
+	}
+	// Same bytes: only a later expiry proves a peer republished. Prefer the
+	// server-side expiry, which client latency cannot move.
+	if token.ServerExpiryMs != 0 && baseline.ServerExpiryMs != 0 {
+		return token.ServerExpiryMs > baseline.ServerExpiryMs+republishSlack.Milliseconds()
+	}
+	return token.ExpiresAt.After(baseline.ExpiresAt.Add(republishSlack))
 }
 
 // resolveShared answers from state somebody else already produced: memory
@@ -391,7 +446,7 @@ func (f *Fetcher) resolveShared(ctx context.Context, failedSHA256 string, entryS
 	for range fetchAdoptRetries {
 		current, gen, seq := f.memory.snapshot()
 		now := f.now()
-		if current.usable(now) && (failedSHA256 == "" || seq != entrySeq) {
+		if current.usable(now) && failedSHA256 == "" {
 			return current.from(FetchSourceMemory), true, observed, nil
 		}
 		stored, present, readErr := f.backend.readRedis(ctx, now)
@@ -400,6 +455,14 @@ func (f *Fetcher) resolveShared(ctx context.Context, failedSHA256 string, entryS
 		}
 		// Judge remaining lifetime at the end of the read, not before it.
 		now = f.now()
+		// A refresh that completed while this report waited answers it only if the
+		// shared record still is that refresh; an external writer may have
+		// replaced it since.
+		if failedSHA256 != "" && seq != entrySeq && current.usable(now) && present &&
+			stored.SHA256 == current.SHA256 && !f.memory.isRevoked(stored.SHA256) && stored.ExpiresAt.After(now) {
+			copied := stored
+			return current.from(FetchSourceMemory), true, &copied, nil
+		}
 		observed = nil
 		if present {
 			copied := stored
@@ -424,6 +487,7 @@ func (f *Fetcher) issueUnderLock(ctx context.Context, failedSHA256 string, entry
 		return FetchedToken{}, errFetchUnavailable
 	}
 	lock.value = value
+	beforeSetNX := time.Now()
 	locked, err := f.Store.SetNX(ctx, lock.key, lock.value, f.backend.redisLockTTL())
 	if err != nil {
 		return FetchedToken{}, errFetchUnavailable
@@ -438,7 +502,10 @@ func (f *Fetcher) issueUnderLock(ctx context.Context, failedSHA256 string, entry
 	}()
 	// A peer can publish between the first read and the lock. Look again while
 	// owning the lock, before contacting the provider.
-	token, found, _, err := f.resolveShared(ctx, failedSHA256, entrySeq, baseline)
+	lock.deadline = leaseDeadline(beforeSetNX, f.backend.redisLockTTL())
+	recheckCtx, cancelRecheck := context.WithDeadline(ctx, lock.deadline)
+	token, found, _, err := f.resolveShared(recheckCtx, failedSHA256, entrySeq, baseline)
+	cancelRecheck()
 	if err != nil {
 		return FetchedToken{}, err
 	}
@@ -546,17 +613,19 @@ func parseCachedTokenPayload(provider TokenProvider, raw string) (string, time.T
 func (s *approvalService) redisLockKey() string        { return s.lockKey }
 func (s *approvalService) redisLockTTL() time.Duration { return approvalLockTTL }
 
-// readRedis reads the raw approval key and its remaining TTL in one atomic
-// Redis operation; the expiry is now plus that TTL because the Redis value
-// carries no timestamp. Two separate reads could pair one key with the fresh TTL
-// of its replacement.
+// readRedis reads the raw approval key, its remaining TTL and its absolute
+// server-side expiry in one atomic Redis operation; the local expiry is now plus
+// that TTL because the Redis value carries no timestamp. Two separate reads
+// could pair one key with the fresh TTL of its replacement.
 func (s *approvalService) readRedis(ctx context.Context, now time.Time) (FetchedToken, bool, error) {
-	raw, ttl, present, err := s.store.GetWithTTL(ctx, s.cacheKey)
+	raw, ttl, serverExpiryMs, present, err := s.store.GetWithTTL(ctx, s.cacheKey)
 	if err != nil {
 		return FetchedToken{}, false, errFetchUnavailable
 	}
 	if !present || strings.TrimSpace(raw) == "" || !safeHeaderText(raw) || ttl <= 0 {
 		return FetchedToken{}, false, nil
 	}
-	return newFetchedToken(raw, now.Add(ttl)), true, nil
+	token := newFetchedToken(raw, now.Add(ttl))
+	token.ServerExpiryMs = serverExpiryMs
+	return token, true, nil
 }

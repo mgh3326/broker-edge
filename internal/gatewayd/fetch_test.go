@@ -2,6 +2,7 @@ package gatewayd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -20,13 +21,25 @@ type countingStore struct {
 	separateReads atomic.Int64
 	// getHook runs once, after the next GET has read its value and before it
 	// returns: it models another actor publishing during a read.
-	hookMu  sync.Mutex
-	getHook func()
+	hookMu         sync.Mutex
+	getHook        func()
+	getWithTTLHook func()
+	afterSetHook   func()
+	// failGetOn makes the Nth GET (1-based, counting GET and PTTL) fail;
+	// getDelay slows every GET.
+	failGetOn atomic.Int64
+	getDelay  time.Duration
 }
 
 func (store *countingStore) Get(ctx context.Context, key string) (string, bool, error) {
 	store.reads.Add(1)
-	store.separateReads.Add(1)
+	n := store.separateReads.Add(1)
+	if store.getDelay > 0 {
+		time.Sleep(store.getDelay)
+	}
+	if store.failGetOn.Load() == n {
+		return "", false, errors.New("redis read failed")
+	}
 	value, present, err := store.fakeRedisStore.Get(ctx, key)
 	store.hookMu.Lock()
 	hook := store.getHook
@@ -44,9 +57,34 @@ func (store *countingStore) TTL(ctx context.Context, key string) (time.Duration,
 	return store.fakeRedisStore.TTL(ctx, key)
 }
 
-func (store *countingStore) GetWithTTL(ctx context.Context, key string) (string, time.Duration, bool, error) {
+func (store *countingStore) GetWithTTL(ctx context.Context, key string) (string, time.Duration, int64, bool, error) {
 	store.reads.Add(1)
+	store.hookMu.Lock()
+	hook := store.getWithTTLHook
+	store.getWithTTLHook = nil
+	store.hookMu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return store.fakeRedisStore.GetWithTTL(ctx, key)
+}
+
+// SetIfLockHeld runs afterSetHook (once) after a successful publish, before the
+// caller learns of it: it models an external writer publishing right after.
+func (store *countingStore) SetIfLockHeld(ctx context.Context, lockKey, lockValue, key, value string, ttl time.Duration) error {
+	err := store.fakeRedisStore.SetIfLockHeld(ctx, lockKey, lockValue, key, value, ttl)
+	store.hookMu.Lock()
+	hook := store.afterSetHook
+	if err == nil {
+		store.afterSetHook = nil
+	} else {
+		hook = nil
+	}
+	store.hookMu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return err
 }
 
 func (store *countingStore) onNextGet(hook func()) {

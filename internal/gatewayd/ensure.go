@@ -143,6 +143,7 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 	if err != nil {
 		return "", errEnsureUnavailable
 	}
+	beforeSetNX := time.Now()
 	locked, err := service.Store.SetNX(ctx, service.LockKey, lockValue, lockTTL)
 	if err != nil {
 		return "", errEnsureUnavailable
@@ -161,7 +162,7 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 	if fresh {
 		return EnsureStateFresh, nil
 	}
-	if _, err := service.issueAndStore(ctx, issuanceLock{key: service.LockKey, value: lockValue}); err != nil {
+	if _, err := service.issueAndStore(ctx, issuanceLock{key: service.LockKey, value: lockValue, deadline: leaseDeadline(beforeSetNX, lockTTL)}); err != nil {
 		return "", errEnsureUnavailable
 	}
 	return EnsureStateIssued, nil
@@ -171,8 +172,12 @@ func (service *EnsureService) Ensure(ctx context.Context) (EnsureState, error) {
 // TTL as always). The caller owns lock; publication is conditional on still
 // holding it, bounded by its lease, and published to memory on success.
 func (service *EnsureService) issueAndStore(ctx context.Context, lock issuanceLock) (FetchedToken, error) {
-	return issueAndPublish(ctx, service.memory, lockTTL, service.now, service.readRedis,
-		func(work context.Context) (FetchedToken, func(context.Context) error, error) {
+	return issueAndPublish(ctx, issuancePlan{
+		memory: service.memory, lock: lock, now: service.now, readRedis: service.readRedis,
+		invalidate: func(c context.Context) error {
+			return service.Store.DeleteIfLockHeld(c, lock.key, lock.value, service.CacheKey)
+		},
+		issue: func(work context.Context) (FetchedToken, func(context.Context) error, error) {
 			issued, err := service.OAuth.Issue(work, service.AppKey, service.AppSecret)
 			if err != nil || !validIssuedToken(issued, providerTokenExpiryBuffer(service.Provider)) {
 				return FetchedToken{}, nil, errEnsureUnavailable
@@ -191,7 +196,8 @@ func (service *EnsureService) issueAndStore(ctx context.Context, lock issuanceLo
 			return token, func(c context.Context) error {
 				return service.Store.SetIfLockHeld(c, lock.key, lock.value, service.CacheKey, payload, ttl)
 			}, nil
-		})
+		},
+	})
 }
 
 func (service *EnsureService) payload(accessToken string, expiresIn int64, now time.Time) (string, error) {

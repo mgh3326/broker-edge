@@ -202,7 +202,7 @@ func TestRedisClientLockConditionalSetAndAtomicGetWithTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	replies := []string{"+OK\r\n", "$-1\r\n", "$20\r\n61000:approval-key-1\r\n", "$-1\r\n"}
+	replies := []string{"+OK\r\n", "$-1\r\n", "$34\r\n1763000061000:61000:approval:key-1\r\n", "$-1\r\n", ":1\r\n", "$-1\r\n"}
 	commands := make(chan []string, len(replies))
 	go func() {
 		defer close(commands)
@@ -230,20 +230,29 @@ func TestRedisClientLockConditionalSetAndAtomicGetWithTTL(t *testing.T) {
 	if err := client.SetIfLockHeld(ctx, "lock", "owner", "cache", "payload", 60*time.Second); !errors.Is(err, errLockLost) {
 		t.Fatalf("lost lock err = %v", err)
 	}
-	value, ttl, present, err := client.GetWithTTL(ctx, "cache")
-	if err != nil || !present || value != "approval-key-1" || ttl != 61*time.Second {
-		t.Fatalf("GetWithTTL = %q %v %t %v", value, ttl, present, err)
+	value, ttl, serverExpiry, present, err := client.GetWithTTL(ctx, "cache")
+	if err != nil || !present || value != "approval:key-1" || ttl != 61*time.Second || serverExpiry != 1763000061000 {
+		t.Fatalf("GetWithTTL = %q %v %d %t %v", value, ttl, serverExpiry, present, err)
 	}
-	if _, _, present, err := client.GetWithTTL(ctx, "cache"); err != nil || present {
+	if _, _, _, present, err := client.GetWithTTL(ctx, "cache"); err != nil || present {
 		t.Fatalf("missing key: present %t err %v", present, err)
 	}
-	set, _, getWithTTL := <-commands, <-commands, <-commands
+	if err := client.DeleteIfLockHeld(ctx, "lock", "owner", "cache"); err != nil {
+		t.Fatalf("delete held: %v", err)
+	}
+	if err := client.DeleteIfLockHeld(ctx, "lock", "owner", "cache"); !errors.Is(err, errLockLost) {
+		t.Fatalf("delete lost err = %v", err)
+	}
+	set, _, getWithTTL, _, del, _ := <-commands, <-commands, <-commands, <-commands, <-commands, <-commands
 	if set[0] != "EVAL" || set[2] != "2" || set[3] != "lock" || set[4] != "cache" || set[5] != "owner" || set[6] != "payload" || set[7] != "60" ||
 		!strings.Contains(set[1], "'SET', KEYS[2]") || !strings.Contains(set[1], "'GET', KEYS[1]") {
 		t.Fatalf("SetIfLockHeld command = %q", set)
 	}
 	if getWithTTL[0] != "EVAL" || getWithTTL[2] != "1" || getWithTTL[3] != "cache" ||
-		!strings.Contains(getWithTTL[1], "'GET'") || !strings.Contains(getWithTTL[1], "'PTTL'") {
+		!strings.Contains(getWithTTL[1], "'GET'") || !strings.Contains(getWithTTL[1], "'PTTL'") || !strings.Contains(getWithTTL[1], "'TIME'") {
 		t.Fatalf("GetWithTTL command = %q", getWithTTL)
+	}
+	if del[0] != "EVAL" || del[2] != "2" || del[3] != "lock" || del[4] != "cache" || del[5] != "owner" || !strings.Contains(del[1], "'DEL', KEYS[2]") {
+		t.Fatalf("DeleteIfLockHeld command = %q", del)
 	}
 }

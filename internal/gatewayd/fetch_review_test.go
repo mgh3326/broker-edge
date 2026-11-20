@@ -3,6 +3,7 @@ package gatewayd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -151,6 +152,9 @@ func TestFetchLateIssuerCannotOverwriteASuccessor(t *testing.T) {
 			}
 			if records := h.store.savedRecords(); len(records) != 0 {
 				t.Fatalf("late issuer wrote Redis: %d records", len(records))
+			}
+			if len(h.store.deletes) != 0 {
+				t.Fatal("a late issuer deleted the successor's record")
 			}
 		})
 	}
@@ -306,4 +310,155 @@ func TestFetchJudgesRemainingLifetimeAfterTheRedisRead(t *testing.T) {
 	if got.Token == externalA || got.Source != FetchSourceIssued {
 		t.Fatalf("served a token with 50 s left (source %s)", got.Source)
 	}
+}
+
+// Without the snapshot that identifies the token being replaced, revoking it
+// afterwards would be impossible: issuance must not start.
+func TestFetchDoesNotCallTheBrokerWhenTheReplacedTokenCannotBeRecorded(t *testing.T) {
+	h := newFetchHarness(t, ProviderToss)
+	h.writeRedis(externalA, 3600)
+	// GET 1: first read, GET 2: under-lock recheck, GET 3: the replaced-token snapshot.
+	h.store.failGetOn.Store(3)
+	if _, err := h.fetcher.Fetch(context.Background(), sha(externalA)); err == nil {
+		t.Fatal("expected failure")
+	}
+	if h.issuer.callCount() != 0 {
+		t.Fatal("the broker was called without a recorded replaced token")
+	}
+	h.store.failGetOn.Store(0)
+	if got := h.fetch(""); got.Token != externalA || h.issuer.callCount() != 0 {
+		t.Fatalf("untouched record not served afterwards: %s", got.Source)
+	}
+}
+
+// The lease is measured from before SET NX, so a slow recheck cannot push the
+// broker call past it; and the broker is not contacted when too little is left.
+func TestFetchLeaseIsMeasuredFromBeforeSetNX(t *testing.T) {
+	h := newFetchHarness(t, ProviderToss)
+	h.writeRedis(externalA, 3600)
+	h.store.getDelay = 150 * time.Millisecond
+	start := time.Now()
+	h.fetch(sha(externalA))
+	h.issuer.mu.Lock()
+	deadline := h.issuer.deadline
+	h.issuer.mu.Unlock()
+	if limit := start.Add(lockTTL - fetchLeaseMargin); !deadline.Before(limit) {
+		t.Fatalf("broker deadline %v is not before %v: the lease was measured after the recheck", deadline.Sub(start), limit.Sub(start))
+	}
+}
+
+func TestIssuanceRefusesToStartWithoutEnoughLeaseLeft(t *testing.T) {
+	h := newFetchHarness(t, ProviderToss)
+	service := h.ensurer.(*EnsureService)
+	for name, remaining := range map[string]time.Duration{"expired": -time.Second, "too short": minIssueWindow + publishReserve - time.Second} {
+		lock := issuanceLock{key: h.lockKey, value: "v", deadline: time.Now().Add(remaining)}
+		if _, err := service.issueAndStore(context.Background(), lock); err == nil {
+			t.Fatalf("%s: issuance started", name)
+		}
+	}
+	if h.issuer.callCount() != 0 {
+		t.Fatal("broker contacted with no lease left")
+	}
+}
+
+// Same-bytes publication evidence must not depend on how long each Redis call
+// took to reach the server.
+func TestApprovalSameKeyIsNotAPublicationJustBecauseTheFirstReadWasSlow(t *testing.T) {
+	h := newFetchHarness(t, ProviderKISLiveApproval)
+	first := h.fetch("")
+	// The baseline read spends 2 s before the server answers.
+	h.store.getWithTTLHook = func() { h.now = h.now.Add(2 * time.Second) }
+	got := h.fetch(first.SHA256)
+	if got.Source != FetchSourceIssued || h.issuer.callCount() != 2 {
+		t.Fatalf("an untouched approval key was returned for its own failure report (source %s)", got.Source)
+	}
+}
+
+// A queued failure report is answered from memory only if the shared record
+// still is the refresh it waited for.
+func TestFetchQueuedReportDoesNotReturnATokenAnExternalWriterReplaced(t *testing.T) {
+	h := newFetchHarness(t, ProviderToss)
+	first := h.fetch("")
+	h.issuer.started = make(chan struct{}, 1)
+	h.issuer.release = make(chan struct{})
+	// Right after the local refresh publishes B, a Python self-mode issuer
+	// publishes C and invalidates B.
+	h.store.afterSetHook = func() { h.writeRedis(externalB, 3600) }
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, err := h.fetcher.Fetch(context.Background(), first.SHA256); err != nil {
+			t.Errorf("refreshing report: %v", err)
+		}
+	}()
+	<-h.issuer.started
+	var queued FetchedToken
+	go func() {
+		defer wg.Done()
+		var err error
+		queued, err = h.fetcher.Fetch(context.Background(), first.SHA256)
+		if err != nil {
+			t.Errorf("queued report: %v", err)
+		}
+	}()
+	time.Sleep(100 * time.Millisecond) // the second report is now waiting behind the first
+	close(h.issuer.release)
+	wg.Wait()
+	if queued.Token != externalB || queued.Source != FetchSourceRedis {
+		t.Fatalf("queued report returned %s (%v), want the external writer's current token", queued.Source, queued.Token == tokenN(2))
+	}
+	if h.issuer.callCount() != 2 {
+		t.Fatalf("issuer calls = %d", h.issuer.callCount())
+	}
+}
+
+// When the broker rotated the token but the Redis write failed, the shared record
+// is withdrawn (under the lock) so a restart or another reader cannot keep
+// accepting the invalidated token.
+func TestFetchWithdrawsTheSharedRecordWhenPublishingAfterRotationFails(t *testing.T) {
+	t.Run("fetch-triggered", func(t *testing.T) {
+		h := newFetchHarness(t, ProviderToss)
+		first := h.fetch("")
+		h.store.setErr = errors.New("redis write failed")
+		if _, err := h.fetcher.Fetch(context.Background(), first.SHA256); err == nil {
+			t.Fatal("expected failure")
+		}
+		h.store.setErr = nil
+		if len(h.store.deletes) != 1 || h.store.deletes[0] != h.cacheKey {
+			t.Fatalf("deletes = %v", h.store.deletes)
+		}
+		if _, present, _ := h.store.Get(context.Background(), h.cacheKey); present {
+			t.Fatal("revoked record still in Redis")
+		}
+		// A restart must not warm the revoked token.
+		restarted := newFetchHarness(t, ProviderToss)
+		restarted.store.fakeRedisStore = h.store.fakeRedisStore
+		restarted.issuer.tokenFn = func(n int) string { return fmt.Sprintf("AFTER-RESTART-%d-0123456789abcdef", n) }
+		restarted.attach(restarted.store)
+		restarted.fetcher.Warm(context.Background())
+		if got := restarted.fetch(""); got.Token == first.Token || got.Source != FetchSourceIssued {
+			t.Fatalf("restart served the revoked token (source %s)", got.Source)
+		}
+	})
+	t.Run("ensure-triggered", func(t *testing.T) {
+		h := newFetchHarness(t, ProviderToss)
+		h.writeRedis(externalA, 90)
+		h.store.setErr = errors.New("redis write failed")
+		if _, err := h.ensurer.Ensure(context.Background()); err == nil {
+			t.Fatal("expected failure")
+		}
+		if len(h.store.deletes) != 1 {
+			t.Fatalf("deletes = %v", h.store.deletes)
+		}
+	})
+	t.Run("withdrawal failing too is still an error, not a panic", func(t *testing.T) {
+		h := newFetchHarness(t, ProviderKISLiveApproval)
+		first := h.fetch("")
+		h.store.setErr = errors.New("redis write failed")
+		h.store.delErr = errors.New("redis delete failed")
+		if _, err := h.fetcher.Fetch(context.Background(), first.SHA256); err == nil {
+			t.Fatal("expected failure")
+		}
+	})
 }

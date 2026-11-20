@@ -30,6 +30,8 @@ type fakeRedisStore struct {
 	getErr   error
 	setErr   error
 	setNXErr error
+	delErr   error
+	deletes  []string
 
 	sets             []setRecord
 	setWhileLockHeld []bool
@@ -273,18 +275,33 @@ func (store *fakeRedisStore) SetIfLockHeld(_ context.Context, lockKey, lockValue
 	return nil
 }
 
-func (store *fakeRedisStore) GetWithTTL(_ context.Context, key string) (string, time.Duration, bool, error) {
+func (store *fakeRedisStore) GetWithTTL(_ context.Context, key string) (string, time.Duration, int64, bool, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.getErr != nil {
-		return "", 0, false, store.getErr
+		return "", 0, 0, false, store.getErr
 	}
 	value, found := store.values[key]
 	if !found || (!value.expiresAt.IsZero() && !store.now().Before(value.expiresAt)) {
-		return "", 0, false, nil
+		return "", 0, 0, false, nil
 	}
 	if value.expiresAt.IsZero() {
-		return value.value, -1, true, nil
+		return value.value, -1, 0, true, nil
 	}
-	return value.value, value.expiresAt.Sub(store.now()), true, nil
+	return value.value, value.expiresAt.Sub(store.now()), value.expiresAt.UnixMilli(), true, nil
+}
+
+func (store *fakeRedisStore) DeleteIfLockHeld(_ context.Context, lockKey, lockValue, key string) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.delErr != nil {
+		return store.delErr
+	}
+	lock, found := store.locks[lockKey]
+	if !found || lock.value != lockValue || (!lock.expiresAt.IsZero() && !store.now().Before(lock.expiresAt)) {
+		return errLockLost
+	}
+	delete(store.values, key)
+	store.deletes = append(store.deletes, key)
+	return nil
 }
